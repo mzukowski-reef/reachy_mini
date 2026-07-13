@@ -23,7 +23,7 @@ from reachy_mini.media.camera_constants import (
     CameraSpecs,
     MujocoCameraSpecs,
 )
-from reachy_mini.media.camera_utils import scale_intrinsics
+from reachy_mini.media.camera_utils import intrinsics_for_size, scale_intrinsics
 from reachy_mini.media.gstreamer_utils import get_sample
 
 try:
@@ -55,6 +55,7 @@ class CameraBase(ABC):
         self.logger = logging.getLogger(type(self).__module__)
         self.logger.setLevel(log_level)
         self._resolution: Optional[CameraResolution] = None
+        self._stream_resolution: Optional[tuple[int, int]] = None
         self.camera_specs: Optional[CameraSpecs] = None
         self.resized_K: Optional[npt.NDArray[np.float64]] = None
         self._jpeg_pipeline: Gst.Pipeline = None
@@ -72,7 +73,23 @@ class CameraBase(ABC):
         """
         if self._resolution is None:
             raise RuntimeError("Camera resolution is not set.")
+        if self._stream_resolution is not None:
+            return self._stream_resolution
         return (self._resolution.value[0], self._resolution.value[1])
+
+    def _update_stream_resolution(self, width: int, height: int) -> None:
+        """Update negotiated frame geometry and its camera intrinsics."""
+        stream_resolution = (width, height)
+        if stream_resolution == self._stream_resolution:
+            return
+        self._stream_resolution = stream_resolution
+        if self.camera_specs is None or self._resolution is None:
+            return
+        self.resized_K = intrinsics_for_size(
+            self.camera_specs.K,
+            self._resolution.value[3],
+            stream_resolution,
+        )
 
     @property
     def framerate(self) -> int:
@@ -146,6 +163,7 @@ class CameraBase(ABC):
         self.resized_K = scale_intrinsics(
             original_K, original_size, target_size, crop_scale
         )
+        self._stream_resolution = None
 
         self._apply_resolution(resolution)
 

@@ -86,6 +86,7 @@ class Args:
     scene: str = "empty"
     headless: bool = False
     no_media: bool = False
+    video_ipc_enabled: bool = True
 
     kinematics_engine: str = "AnalyticalKinematics"
     check_collision: bool = False
@@ -281,6 +282,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
         desktop_app_daemon=args.desktop_app_daemon,
         log_level=args.log_level,
         no_media=args.no_media,
+        video_ipc_enabled=args.video_ipc_enabled,
         sim_mode=sim_mode,
     )
     app.state.app_manager = AppManager(
@@ -671,6 +673,13 @@ def main() -> None:
         action="store_true",
         default=default_args.no_media,
         help="Disable all media (camera, audio, WebRTC). Use if you handle media yourself.",
+    )
+    parser.add_argument(
+        "--no-video-ipc",
+        action="store_false",
+        dest="video_ipc_enabled",
+        default=default_args.video_ipc_enabled,
+        help="Disable the local raw-video IPC branch while keeping WebRTC media enabled.",
     )
     # Daemon options
     parser.add_argument(

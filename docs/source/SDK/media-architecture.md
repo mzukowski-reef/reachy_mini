@@ -19,6 +19,26 @@ The daemon starts its media pipeline automatically unless the `--no-media` flag 
 3. Feeds both into a WebRTC server (`webrtcsink`) for remote streaming.
 4. Exposes raw camera frames via a local IPC endpoint (`unixfdsink` on Linux/macOS, `win32ipcvideosink` on Windows). The IPC feed is served at a capped framerate (10 fps) below the capture rate: local vision clients convert every frame they are served, so the cap keeps on-device CPU low regardless of the camera mode.
 
+The capture mode and the shared processing stream are intentionally separate. By default, the daemon converts the native camera feed to `1280x720@15fps` before the IPC and WebRTC branches. On MJPEG cameras, excess compressed frames are discarded before JPEG decoding to avoid paying the CPU cost for frames no consumer will receive.
+
+Set the shared stream geometry before starting the daemon:
+
+```bash
+REACHY_MINI_PROCESSING_SIZE=960x540 \
+REACHY_MINI_PROCESSING_FRAMERATE=15 \
+reachy-mini-daemon
+```
+
+Both local and WebRTC clients preserve the negotiated stream dimensions and expose camera intrinsics scaled to the received frame size. Requested values above the native capture dimensions or framerate are clamped to the capture mode.
+
+When every media consumer connects through WebRTC, disable the unused raw-video IPC branch to avoid its I420-to-BGR conversion and shared-memory traffic:
+
+```bash
+reachy-mini-daemon --no-video-ipc
+```
+
+This keeps camera, audio, playback, and WebRTC enabled. Local SDK camera clients and daemon-side face tracking require video IPC and are unavailable in this mode.
+
 [![Reachy Mini Media Daemon](https://github.com/pollen-robotics/reachy_mini/raw/main/docs/assets/reachymini_media_daemon.png)]()
 
 ### Client Side

@@ -48,6 +48,7 @@ from reachy_mini.media.camera_constants import (
     MujocoCameraSpecs,
     ReachyMiniLiteCamSpecs,
 )
+from reachy_mini.media.camera_utils import intrinsics_for_size
 from reachy_mini.media.device_detection import get_audio_device, get_video_device
 from reachy_mini.media.gstreamer_utils import handle_default_bus_message
 from reachy_mini.motion.head_wobbler import HeadWobbler, SpeechOffsets
@@ -84,6 +85,9 @@ SESSION_FAILED_REASON_PC_FAILED = "peer_connection_failed"
 
 # Cap the local IPC feed below the capture rate; it also paces every client, face tracker included.
 IPC_FPS = 10
+
+DEFAULT_PROCESSING_SIZE = (1280, 720)
+DEFAULT_PROCESSING_FRAMERATE = 15
 
 
 @dataclass
@@ -165,6 +169,7 @@ class GstMediaServer:
         self,
         log_level: str = "INFO",
         sim_mode: SimulationMode = SimulationMode.NONE,
+        video_ipc_enabled: bool = True,
     ) -> None:
         """Initialize the GStreamer WebRTC pipeline.
 
@@ -172,6 +177,7 @@ class GstMediaServer:
             log_level: Logging level for WebRTC daemon operations.
             sim_mode: Simulation mode. MUJOCO receives video via UDP,
                 MOCKUP uses autovideosrc, NONE detects a physical camera.
+            video_ipc_enabled: Whether to expose raw local camera frames through IPC.
 
         Raises:
             RuntimeError: If no camera is detected (unless in simulation mode)
@@ -180,6 +186,7 @@ class GstMediaServer:
         """
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(log_level)
+        self._video_ipc_enabled = video_ipc_enabled
         self._log_level = log_level
         self._sim_mode = sim_mode
 
@@ -206,10 +213,11 @@ class GstMediaServer:
                     self.camera_specs = detected_specs
 
         self._resolution = self.camera_specs.default_resolution
-        self.resized_K = self.camera_specs.K
 
         if self._resolution is None:
             raise RuntimeError("Failed to get default camera resolution.")
+
+        self._configure_processing_video()
 
         self._cam_path = cam_path
 
@@ -640,6 +648,89 @@ class GstMediaServer:
         """Get the current camera framerate."""
         return self._resolution.value[2]
 
+    @property
+    def processing_resolution(self) -> tuple[int, int]:
+        """Get the shared raw stream resolution after source processing."""
+        return self._processing_resolution
+
+    @property
+    def processing_framerate(self) -> int:
+        """Get the shared raw stream frame rate after source processing."""
+        return self._processing_framerate
+
+    def _configure_processing_video(self) -> None:
+        """Read and validate the shared video processing configuration."""
+        requested_size = os.environ.get(
+            "REACHY_MINI_PROCESSING_SIZE",
+            f"{DEFAULT_PROCESSING_SIZE[0]}x{DEFAULT_PROCESSING_SIZE[1]}",
+        )
+        try:
+            width_text, height_text = requested_size.lower().split("x", 1)
+            requested_resolution = (int(width_text), int(height_text))
+            if requested_resolution[0] <= 0 or requested_resolution[1] <= 0:
+                raise ValueError
+        except ValueError:
+            self._logger.warning(
+                "Invalid REACHY_MINI_PROCESSING_SIZE=%r; using %dx%d.",
+                requested_size,
+                *DEFAULT_PROCESSING_SIZE,
+            )
+            requested_resolution = DEFAULT_PROCESSING_SIZE
+
+        source_width, source_height = self.resolution
+        if (
+            requested_resolution[0] > source_width
+            or requested_resolution[1] > source_height
+        ):
+            self._logger.warning(
+                "Requested processing size %dx%d exceeds capture size %dx%d; "
+                "using the capture size.",
+                *requested_resolution,
+                source_width,
+                source_height,
+            )
+            requested_resolution = self.resolution
+
+        requested_framerate_text = os.environ.get(
+            "REACHY_MINI_PROCESSING_FRAMERATE",
+            str(DEFAULT_PROCESSING_FRAMERATE),
+        )
+        try:
+            requested_framerate = int(requested_framerate_text)
+            if requested_framerate <= 0:
+                raise ValueError
+        except ValueError:
+            self._logger.warning(
+                "Invalid REACHY_MINI_PROCESSING_FRAMERATE=%r; using %d.",
+                requested_framerate_text,
+                DEFAULT_PROCESSING_FRAMERATE,
+            )
+            requested_framerate = DEFAULT_PROCESSING_FRAMERATE
+
+        self._processing_resolution = requested_resolution
+        self._processing_framerate = min(requested_framerate, self.framerate)
+        self.resized_K = intrinsics_for_size(
+            self.camera_specs.K,
+            self._resolution.value[3],
+            self._processing_resolution,
+        )
+        self._logger.info(
+            "Camera capture is %dx%d@%dfps; shared processing stream is %dx%d@%dfps.",
+            source_width,
+            source_height,
+            self.framerate,
+            *self._processing_resolution,
+            self._processing_framerate,
+        )
+
+    def _processing_raw_caps(self) -> Gst.Caps:
+        """Build the raw I420 caps shared by IPC and WebRTC branches."""
+        width, height = self.processing_resolution
+        return Gst.Caps.from_string(
+            f"video/x-raw,format=I420,width={width},height={height},"
+            f"framerate={self.processing_framerate}/1"
+        )
+
     def _configure_video(
         self, cam_path: str, pipeline: Gst.Pipeline, webrtcsink: Gst.Element
     ) -> None:
@@ -713,12 +804,7 @@ class GstMediaServer:
         # the IPC-branch videoconvert would run in passthrough mode and
         # skip the FD-backed buffer re-allocation that unixfdsink requires.
         if not is_rpi:
-            caps_raw = Gst.Caps.from_string(
-                f"video/x-raw,format=I420,"
-                f"width={self.resolution[0]},"
-                f"height={self.resolution[1]},"
-                f"framerate={self.framerate}/1"
-            )
+            caps_raw = self._processing_raw_caps()
             capsfilter_raw = Gst.ElementFactory.make("capsfilter", "pre_tee_caps")
             capsfilter_raw.set_property("caps", caps_raw)
             pipeline.add(capsfilter_raw)
@@ -730,8 +816,11 @@ class GstMediaServer:
         pipeline.add(tee)
         last_source.link(tee)
 
-        # IPC branch: share camera with local applications
-        self._build_ipc_branch(tee, pipeline, is_rpi=is_rpi)
+        # IPC branch: share camera with local applications when requested.
+        if self._video_ipc_enabled:
+            self._build_ipc_branch(tee, pipeline, is_rpi=is_rpi)
+        else:
+            self._logger.info("Local video IPC is disabled.")
 
         # WebRTC branch
         queue_webrtc = Gst.ElementFactory.make("queue", "queue_webrtc")
@@ -793,9 +882,10 @@ class GstMediaServer:
     def _build_libcamera_source(self) -> list[Gst.Element]:
         """Build source chain for RPi CSI camera (libcamerasrc)."""
         camerasrc = Gst.ElementFactory.make("libcamerasrc")
+        width, height = self.processing_resolution
         caps = Gst.Caps.from_string(
-            f"video/x-raw,width={self.resolution[0]},height={self.resolution[1]},"
-            f"framerate={self.framerate}/1,format=YUY2,"
+            f"video/x-raw,width={width},height={height},"
+            f"framerate={self.processing_framerate}/1,format=YUY2,"
             "colorimetry=bt709,interlace-mode=progressive"
         )
         capsfilter = Gst.ElementFactory.make("capsfilter")
@@ -825,11 +915,38 @@ class GstMediaServer:
         capsfilter.set_property("caps", caps_mjpeg)
 
         queue = Gst.ElementFactory.make("queue")
-        # Decode MJPEG to raw so all platforms share one IPC/WebRTC pipeline.
+        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", 2)
+
+        videorate = Gst.ElementFactory.make("videorate", "source_mjpeg_videorate")
+        videorate.set_property("drop-only", True)
+        videorate.set_property("max-rate", self.processing_framerate)
+
+        limited_caps = Gst.Caps.from_string(
+            f"image/jpeg,width={self.resolution[0]},"
+            f"height={self.resolution[1]},"
+            f"framerate={self.processing_framerate}/1"
+        )
+        limited_capsfilter = Gst.ElementFactory.make(
+            "capsfilter", "source_mjpeg_limited_caps"
+        )
+        limited_capsfilter.set_property("caps", limited_caps)
+
+        # Discard compressed frames before paying the JPEG decode cost.
         jpegdec = Gst.ElementFactory.make("jpegdec")
+        videoscale = Gst.ElementFactory.make("videoscale")
         videoconvert = Gst.ElementFactory.make("videoconvert")
 
-        elements = [camsrc, capsfilter, queue, jpegdec, videoconvert]
+        elements = [
+            camsrc,
+            capsfilter,
+            queue,
+            videorate,
+            limited_capsfilter,
+            jpegdec,
+            videoscale,
+            videoconvert,
+        ]
         if not all(elements):
             raise RuntimeError("Failed to create V4L2 video source elements")
         return elements
@@ -855,10 +972,35 @@ class GstMediaServer:
         capsfilter.set_property("caps", caps_mjpeg)
 
         queue = Gst.ElementFactory.make("queue")
+        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", 2)
+
+        videorate = Gst.ElementFactory.make("videorate", "source_mjpeg_videorate")
+        videorate.set_property("drop-only", True)
+        videorate.set_property("max-rate", self.processing_framerate)
+        limited_caps = Gst.Caps.from_string(
+            f"image/jpeg,width={self.resolution[0]},"
+            f"height={self.resolution[1]},"
+            f"framerate={self.processing_framerate}/1"
+        )
+        limited_capsfilter = Gst.ElementFactory.make(
+            "capsfilter", "source_mjpeg_limited_caps"
+        )
+        limited_capsfilter.set_property("caps", limited_caps)
         jpegdec = Gst.ElementFactory.make("jpegdec")
+        videoscale = Gst.ElementFactory.make("videoscale")
         videoconvert = Gst.ElementFactory.make("videoconvert")
 
-        elements = [camsrc, capsfilter, queue, jpegdec, videoconvert]
+        elements = [
+            camsrc,
+            capsfilter,
+            queue,
+            videorate,
+            limited_capsfilter,
+            jpegdec,
+            videoscale,
+            videoconvert,
+        ]
         if not all(elements):
             raise RuntimeError("Failed to create Windows video source elements")
         return elements
@@ -885,9 +1027,13 @@ class GstMediaServer:
         capsfilter.set_property("caps", caps_raw)
 
         queue = Gst.ElementFactory.make("queue")
+        videorate = Gst.ElementFactory.make("videorate")
+        videorate.set_property("drop-only", True)
+        videorate.set_property("max-rate", self.processing_framerate)
+        videoscale = Gst.ElementFactory.make("videoscale")
         videoconvert = Gst.ElementFactory.make("videoconvert")
 
-        elements = [camsrc, capsfilter, queue, videoconvert]
+        elements = [camsrc, capsfilter, queue, videorate, videoscale, videoconvert]
         if not all(elements):
             raise RuntimeError("Failed to create macOS video source elements")
         return elements
@@ -977,8 +1123,8 @@ class GstMediaServer:
 
             caps_bgr = Gst.Caps.from_string(
                 f"video/x-raw,format=BGR,"
-                f"width={self.resolution[0]},"
-                f"height={self.resolution[1]},"
+                f"width={self.processing_resolution[0]},"
+                f"height={self.processing_resolution[1]},"
                 f"framerate={IPC_FPS}/1"
             )
             capsfilter_ipc = Gst.ElementFactory.make("capsfilter", "ipc_capsfilter")

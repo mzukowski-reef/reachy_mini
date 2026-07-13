@@ -45,6 +45,7 @@ class Daemon:
         wireless_version: bool = False,
         desktop_app_daemon: bool = False,
         no_media: bool = False,
+        video_ipc_enabled: bool = True,
         sim_mode: SimulationMode = SimulationMode.NONE,
     ) -> None:
         """Initialize the Reachy Mini daemon."""
@@ -103,7 +104,11 @@ class Daemon:
             from reachy_mini.media.media_server import GstMediaServer
 
             try:
-                self._media_server = GstMediaServer(log_level, sim_mode=sim_mode)
+                self._media_server = GstMediaServer(
+                    log_level,
+                    sim_mode=sim_mode,
+                    video_ipc_enabled=video_ipc_enabled,
+                )
                 self._status.camera_specs_name = self._media_server.camera_specs.name
             except Exception as e:
                 self.logger.error(f"Failed to initialize media server: {e}")

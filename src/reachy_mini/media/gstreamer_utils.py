@@ -76,6 +76,35 @@ def get_sample(appsink: GstApp.AppSink, logger: logging.Logger) -> Optional[byte
     return data
 
 
+def get_video_sample(
+    appsink: GstApp.AppSink, logger: logging.Logger
+) -> Optional[tuple[bytes, int, int]]:
+    """Pull a BGR video sample together with its negotiated dimensions."""
+    sample = appsink.try_pull_sample(20_000_000)
+    if sample is None or not isinstance(sample, Gst.Sample):
+        return None
+    caps = sample.get_caps()
+    buffer = sample.get_buffer()
+    if caps is None or buffer is None:
+        logger.warning("Video sample is missing caps or buffer")
+        return None
+    structure = caps.get_structure(0)
+    width = int(structure.get_value("width"))
+    height = int(structure.get_value("height"))
+    data = buffer.extract_dup(0, buffer.get_size())
+    expected_size = width * height * 3
+    if len(data) != expected_size:
+        logger.warning(
+            "Unexpected BGR sample size: got %d bytes, expected %d for %dx%d",
+            len(data),
+            expected_size,
+            width,
+            height,
+        )
+        return None
+    return data, width, height
+
+
 def is_valid_audio_file(path: str) -> bool:
     """Return whether the file at *path* is a decodable audio file.
 

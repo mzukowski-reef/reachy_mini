@@ -57,7 +57,10 @@ from reachy_mini.media.camera_constants import (
     CameraSpecs,
     ReachyMiniLiteCamSpecs,
 )
-from reachy_mini.media.gstreamer_utils import get_sample, handle_default_bus_message
+from reachy_mini.media.gstreamer_utils import (
+    get_video_sample,
+    handle_default_bus_message,
+)
 
 try:
     import gi
@@ -128,7 +131,7 @@ class GStreamerCamera(CameraBase):
 
         # Create appsink for frame output
         self._appsink_video: GstApp = Gst.ElementFactory.make("appsink")
-        self.set_resolution(self._resolution)
+        self._configure_video_sink_caps()
         self._appsink_video.set_property("drop", True)
         self._appsink_video.set_property("max-buffers", 1)
         self.pipeline.add(self._appsink_video)
@@ -144,16 +147,17 @@ class GStreamerCamera(CameraBase):
             should_restart = True
 
         self._resolution = resolution
-        # No framerate constraint: the daemon may serve the IPC feed below the capture rate.
-        caps_video = Gst.Caps.from_string(
-            f"video/x-raw,format=BGR,"
-            f"width={self._resolution.value[0]},"
-            f"height={self._resolution.value[1]}"
-        )
-        self._appsink_video.set_property("caps", caps_video)
+        self._stream_resolution = None
+        self._configure_video_sink_caps()
 
         if should_restart:
             self.open()
+
+    def _configure_video_sink_caps(self) -> None:
+        """Request BGR without rescaling the daemon's negotiated stream."""
+        self._appsink_video.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw,format=BGR")
+        )
 
     def _build_ipc_source(self) -> None:
         """Build the IPC source pipeline for the current platform.
@@ -261,12 +265,12 @@ class GStreamerCamera(CameraBase):
             or ``None`` if no frame is available within the timeout.
 
         """
-        data = get_sample(self._appsink_video, self.logger)
-        if data is None:
+        sample = get_video_sample(self._appsink_video, self.logger)
+        if sample is None:
             return None
-        return np.frombuffer(data, dtype=np.uint8).reshape(
-            (self.resolution[1], self.resolution[0], 3)
-        )
+        data, width, height = sample
+        self._update_stream_resolution(width, height)
+        return np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
 
     def close(self) -> None:
         """Stop the pipeline and release resources."""

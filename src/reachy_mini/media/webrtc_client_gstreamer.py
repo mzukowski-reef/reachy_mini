@@ -58,7 +58,7 @@ from reachy_mini.media.camera_constants import (
     CameraSpecs,
     ReachyMiniLiteCamSpecs,
 )
-from reachy_mini.media.gstreamer_utils import get_sample
+from reachy_mini.media.gstreamer_utils import get_video_sample
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -132,8 +132,8 @@ class GstWebRTCClient(CameraBase, AudioBase):
         self._appsink_video.set_property("max-buffers", 1)  # keep last image only
         self._pipeline_record.add(self._appsink_video)
 
-        # Set resolution after appsink is created so caps can be properly configured
-        self.set_resolution(self.camera_specs.default_resolution)
+        self._resolution = self.camera_specs.default_resolution
+        self._configure_video_sink_caps()
 
         self._webrtcsrc = self._configure_webrtcsrc(
             signaling_host, signaling_port, peer_id
@@ -156,13 +156,14 @@ class GstWebRTCClient(CameraBase, AudioBase):
             )
 
         self._resolution = resolution
-        caps_video = Gst.Caps.from_string(
-            f"video/x-raw,format=BGR,"
-            f"width={self._resolution.value[0]},"
-            f"height={self._resolution.value[1]},"
-            f"framerate={self.framerate}/1"
+        self._stream_resolution = None
+        self._configure_video_sink_caps()
+
+    def _configure_video_sink_caps(self) -> None:
+        """Request BGR without upscaling to the camera capture mode."""
+        self._appsink_video.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw,format=BGR")
         )
-        self._appsink_video.set_property("caps", caps_video)
 
     def _configure_webrtcsrc(
         self, signaling_host: str, signaling_port: int, peer_id: str
@@ -339,12 +340,12 @@ class GstWebRTCClient(CameraBase, AudioBase):
             A NumPy array of shape ``(height, width, 3)`` or ``None``.
 
         """
-        data = get_sample(self._appsink_video, self.logger)
-        if data is None:
+        sample = get_video_sample(self._appsink_video, self.logger)
+        if sample is None:
             return None
-        return np.frombuffer(data, dtype=np.uint8).reshape(
-            (self.resolution[1], self.resolution[0], 3)
-        )
+        data, width, height = sample
+        self._update_stream_resolution(width, height)
+        return np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
 
     def close(self) -> None:
         """Stop the WebRTC pipeline."""
