@@ -39,6 +39,14 @@ reachy-mini-daemon --no-video-ipc
 
 This keeps camera, audio, playback, and WebRTC enabled. Local SDK camera clients and daemon-side face tracking require video IPC and are unavailable in this mode.
 
+With video IPC disabled, camera processing is demand-driven. A cheap black
+stream keeps the WebRTC producer discoverable while the real camera's JPEG
+decoding, scaling, and color conversion are suspended. The first WebRTC
+consumer switches the selector to the camera stream; after the last consumer
+disconnects, it switches back to idle video and gates the camera processing.
+With video IPC enabled, the shared stream remains active because local
+consumers are not represented by WebRTC sessions.
+
 [![Reachy Mini Media Daemon](https://github.com/pollen-robotics/reachy_mini/raw/main/docs/assets/reachymini_media_daemon.png)]()
 
 ### Client Side

@@ -88,6 +88,8 @@ IPC_FPS = 10
 
 DEFAULT_PROCESSING_SIZE = (1280, 720)
 DEFAULT_PROCESSING_FRAMERATE = 15
+VALVE_DROP_MODE_TRANSFORM_TO_GAP = 2
+VIDEO_TEST_PATTERN_BLACK = 2
 
 
 @dataclass
@@ -244,6 +246,12 @@ class GstMediaServer:
         # mutation. The critical sections are tiny (a few field
         # writes) so contention is negligible.
         self._peer_states_lock = Lock()
+        self._video_consumers: set[str] = set()
+        self._video_consumers_lock = Lock()
+        self._video_demand_gate: Optional[Gst.Element] = None
+        self._video_demand_selector: Optional[Gst.Element] = None
+        self._video_camera_pad: Optional[Gst.Pad] = None
+        self._video_idle_pad: Optional[Gst.Pad] = None
         self._incoming_audio: Dict[str, Dict[str, Any]] = {}
         self._playbin: Optional[Gst.Element] = None
         self._head_wobbler: Optional[HeadWobbler] = None
@@ -257,6 +265,12 @@ class GstMediaServer:
 
     def _build_pipeline(self) -> None:
         """Build (or rebuild) the GStreamer pipeline from scratch."""
+        with self._video_consumers_lock:
+            self._video_consumers.clear()
+        self._video_demand_gate = None
+        self._video_demand_selector = None
+        self._video_camera_pad = None
+        self._video_idle_pad = None
         self._pipeline_sender = Gst.Pipeline.new("reachymini_webrtc_sender")
         self._bus_sender = self._pipeline_sender.get_bus()
         self._bus_sender.add_watch(
@@ -348,6 +362,7 @@ class GstMediaServer:
         webrtcbin: Gst.Element,
     ) -> None:
         self._logger.info(f"consumer added with peer id: {peer_id}")
+        self._set_video_consumer_active(peer_id, active=True)
 
         # Gst.debug_bin_to_dot_file(
         #     self._pipeline_sender, Gst.DebugGraphDetails.ALL, "pipeline_full"
@@ -410,6 +425,7 @@ class GstMediaServer:
         webrtcbin: Gst.Element,
     ) -> None:
         self._logger.info(f"consumer removed: {peer_id}")
+        self._set_video_consumer_active(peer_id, active=False)
         self._cleanup_incoming_audio(peer_id)
         # Cancel any outstanding watchdog for this peer; the consumer
         # is gone so there's nothing left to police.
@@ -731,6 +747,93 @@ class GstMediaServer:
             f"framerate={self.processing_framerate}/1"
         )
 
+    def _build_video_demand_gate(self) -> list[Gst.Element]:
+        """Build a source gate when WebRTC is the only video consumer."""
+        if self._video_ipc_enabled:
+            return []
+
+        gate = Gst.ElementFactory.make("valve", "video_demand_gate")
+        if gate is None:
+            raise RuntimeError("Failed to create the video demand gate")
+        gate.set_property("drop", True)
+        # Preserve the stream timeline with GAP events while real buffers are
+        # blocked. This keeps the WebRTC producer discoverable without paying
+        # the downstream decode/scale/convert cost.
+        gate.set_property("drop-mode", VALVE_DROP_MODE_TRANSFORM_TO_GAP)
+        self._video_demand_gate = gate
+        return [gate]
+
+    def _build_video_demand_selector(
+        self, camera_source: Gst.Element, pipeline: Gst.Pipeline
+    ) -> Gst.Element:
+        """Feed cheap idle frames while the real camera processing is gated."""
+        selector = Gst.ElementFactory.make("input-selector", "video_demand_selector")
+        idle_source = Gst.ElementFactory.make("videotestsrc", "video_idle_source")
+        idle_capsfilter = Gst.ElementFactory.make("capsfilter", "video_idle_caps")
+        if not all((selector, idle_source, idle_capsfilter)):
+            raise RuntimeError("Failed to create the video demand selector")
+
+        idle_source.set_property("is-live", True)
+        idle_source.set_property("do-timestamp", True)
+        idle_source.set_property("pattern", VIDEO_TEST_PATTERN_BLACK)
+        idle_capsfilter.set_property("caps", self._processing_raw_caps())
+
+        for element in (selector, idle_source, idle_capsfilter):
+            pipeline.add(element)
+        idle_source.link(idle_capsfilter)
+
+        camera_pad = selector.request_pad_simple("sink_%u")
+        idle_pad = selector.request_pad_simple("sink_%u")
+        if camera_pad is None or idle_pad is None:
+            raise RuntimeError("Failed to request video selector pads")
+        if camera_source.get_static_pad("src").link(camera_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link camera to the video demand selector")
+        if idle_capsfilter.get_static_pad("src").link(idle_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link idle video to the demand selector")
+
+        selector.set_property("active-pad", idle_pad)
+        self._video_demand_selector = selector
+        self._video_camera_pad = camera_pad
+        self._video_idle_pad = idle_pad
+        return selector
+
+    def _set_video_consumer_active(self, peer_id: str, *, active: bool) -> None:
+        """Open video processing for the first WebRTC peer and close it after the last."""
+        if self._video_ipc_enabled:
+            return
+
+        with self._video_consumers_lock:
+            was_active = bool(self._video_consumers)
+            if active:
+                self._video_consumers.add(peer_id)
+            else:
+                self._video_consumers.discard(peer_id)
+            is_active = bool(self._video_consumers)
+            consumer_count = len(self._video_consumers)
+
+        if was_active == is_active:
+            return
+
+        gate = self._video_demand_gate
+        if gate is None:
+            self._logger.warning("Video demand changed before its gate was available")
+            return
+        selector = self._video_demand_selector
+        if is_active:
+            gate.set_property("drop", False)
+            if selector is not None and self._video_camera_pad is not None:
+                selector.set_property("active-pad", self._video_camera_pad)
+        else:
+            if selector is not None and self._video_idle_pad is not None:
+                selector.set_property("active-pad", self._video_idle_pad)
+            gate.set_property("drop", True)
+        self._logger.info(
+            "WebRTC video processing %s (%d active consumer%s).",
+            "enabled" if is_active else "suspended",
+            consumer_count,
+            "" if consumer_count == 1 else "s",
+        )
+
     def _configure_video(
         self, cam_path: str, pipeline: Gst.Pipeline, webrtcsink: Gst.Element
     ) -> None:
@@ -798,6 +901,9 @@ class GstMediaServer:
 
         is_rpi = cam_path == "imx708"
 
+        if not self._video_ipc_enabled:
+            last_source = self._build_video_demand_selector(last_source, pipeline)
+
         # Pin the raw video format before the tee so that both branches
         # receive a known format.  On non-RPi paths this must be a format
         # that differs from BGR (the IPC branch output format), otherwise
@@ -851,7 +957,14 @@ class GstMediaServer:
         videoconvert = Gst.ElementFactory.make("videoconvert")
         videorate = Gst.ElementFactory.make("videorate")
 
-        elements = [udpsrc, queue, rtpvrawdepay, videoconvert, videorate]
+        elements = [
+            udpsrc,
+            queue,
+            rtpvrawdepay,
+            *self._build_video_demand_gate(),
+            videoconvert,
+            videorate,
+        ]
         if not all(elements):
             raise RuntimeError("Failed to create simulation video source elements")
         return elements
@@ -874,7 +987,13 @@ class GstMediaServer:
         capsfilter = Gst.ElementFactory.make("capsfilter")
         capsfilter.set_property("caps", caps_raw)
 
-        elements = [camsrc, videoconvert, videorate, capsfilter]
+        elements = [
+            camsrc,
+            *self._build_video_demand_gate(),
+            videoconvert,
+            videorate,
+            capsfilter,
+        ]
         if not all(elements):
             raise RuntimeError("Failed to create autovideo source elements")
         return elements
@@ -891,7 +1010,7 @@ class GstMediaServer:
         capsfilter = Gst.ElementFactory.make("capsfilter")
         capsfilter.set_property("caps", caps)
 
-        elements = [camerasrc, capsfilter]
+        elements = [camerasrc, capsfilter, *self._build_video_demand_gate()]
         if not all(elements):
             raise RuntimeError("Failed to create libcamerasrc elements")
         return elements
@@ -943,6 +1062,7 @@ class GstMediaServer:
             queue,
             videorate,
             limited_capsfilter,
+            *self._build_video_demand_gate(),
             jpegdec,
             videoscale,
             videoconvert,
@@ -997,6 +1117,7 @@ class GstMediaServer:
             queue,
             videorate,
             limited_capsfilter,
+            *self._build_video_demand_gate(),
             jpegdec,
             videoscale,
             videoconvert,
@@ -1033,7 +1154,15 @@ class GstMediaServer:
         videoscale = Gst.ElementFactory.make("videoscale")
         videoconvert = Gst.ElementFactory.make("videoconvert")
 
-        elements = [camsrc, capsfilter, queue, videorate, videoscale, videoconvert]
+        elements = [
+            camsrc,
+            capsfilter,
+            queue,
+            videorate,
+            *self._build_video_demand_gate(),
+            videoscale,
+            videoconvert,
+        ]
         if not all(elements):
             raise RuntimeError("Failed to create macOS video source elements")
         return elements

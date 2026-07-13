@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from threading import Lock
 from unittest.mock import MagicMock
 
 import gi
@@ -26,6 +27,12 @@ def _make_server(monkeypatch) -> GstMediaServer:  # type: ignore[no-untyped-def]
     server.camera_specs = ReachyMiniLiteCamSpecs()
     server._resolution = server.camera_specs.default_resolution
     server._video_ipc_enabled = True
+    server._video_consumers = set()
+    server._video_consumers_lock = Lock()
+    server._video_demand_gate = None
+    server._video_demand_selector = None
+    server._video_camera_pad = None
+    server._video_idle_pad = None
     server._loop = MagicMock()
     server._bus_sender = MagicMock()
     server._configure_processing_video()
@@ -109,3 +116,45 @@ def test_video_pipeline_omits_disabled_ipc_branch(monkeypatch) -> None:  # type:
     assert pipeline.get_by_name("queue_ipc") is None
     assert pipeline.get_by_name("ipc_videoconvert") is None
     assert pipeline.get_by_name("queue_webrtc") is not None
+    assert pipeline.get_by_name("video_demand_gate") is not None
+    selector = pipeline.get_by_name("video_demand_selector")
+    assert selector is not None
+    assert selector.get_property("active-pad") == server._video_idle_pad
+
+    server._set_video_consumer_active("peer-a", active=True)
+    assert selector.get_property("active-pad") == server._video_camera_pad
+
+    server._set_video_consumer_active("peer-a", active=False)
+    assert selector.get_property("active-pad") == server._video_idle_pad
+
+
+def test_webrtc_demand_gate_wraps_expensive_jpeg_processing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Decode camera frames only while at least one WebRTC peer consumes video."""
+    server = _make_server(monkeypatch)
+    server._video_ipc_enabled = False
+
+    elements = server._build_v4l2_source("/dev/video-test")
+
+    assert _factory_names(elements) == [
+        "v4l2src",
+        "capsfilter",
+        "queue",
+        "videorate",
+        "capsfilter",
+        "valve",
+        "jpegdec",
+        "videoscale",
+        "videoconvert",
+    ]
+    gate = elements[5]
+    assert gate.get_property("drop") is True
+
+    server._set_video_consumer_active("peer-a", active=True)
+    assert gate.get_property("drop") is False
+
+    server._set_video_consumer_active("peer-b", active=True)
+    server._set_video_consumer_active("peer-a", active=False)
+    assert gate.get_property("drop") is False
+
+    server._set_video_consumer_active("peer-b", active=False)
+    assert gate.get_property("drop") is True
