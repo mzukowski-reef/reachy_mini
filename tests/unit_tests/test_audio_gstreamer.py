@@ -55,11 +55,12 @@ def test_push_first_buffer_anchors_to_running_time() -> None:
     assert buf.has_flags(Gst.BufferFlags.DISCONT)
     assert buf.pts == 2_000_000_000
     assert buf.dts == 2_000_000_000
+    assert buf.duration == 100_000_000
     assert fake._appsrc_pts == 2_100_000_000
 
 
 def test_push_continues_without_gap() -> None:
-    """Follow-up buffers within GAP_RESET_NS are placed contiguously, untimestamped."""
+    """Follow-up buffers carry the next contiguous timestamp and duration."""
     fake = _fake_self(running_time_ns=1_050_000_000, prev_pts_ns=1_100_000_000)
     data = np.zeros(800, dtype=np.float32)
 
@@ -68,8 +69,9 @@ def test_push_continues_without_gap() -> None:
     buf = fake._appsrc.pushed
     assert buf is not None
     assert not buf.has_flags(Gst.BufferFlags.DISCONT)
-    assert buf.pts == Gst.CLOCK_TIME_NONE
-    assert buf.dts == Gst.CLOCK_TIME_NONE
+    assert buf.pts == 1_100_000_000
+    assert buf.dts == 1_100_000_000
+    assert buf.duration == 50_000_000
     assert fake._appsrc_pts == 1_150_000_000
 
 

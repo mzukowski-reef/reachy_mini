@@ -79,8 +79,8 @@ class AudioBase(ABC):
         or after a gap larger than ``GAP_RESET_NS`` carries the ``DISCONT``
         flag and a PTS anchored to the current running-time, so an
         ``audiomixer`` downstream can align it on the current timeline.
-        Follow-up buffers leave PTS/DTS as ``CLOCK_TIME_NONE`` so the
-        mixer places them contiguously by byte offset.
+        Every buffer carries explicit PTS/DTS and duration. This keeps a live
+        mixer from inserting silence between separately pushed PCM chunks.
 
         Returns the ``Gst.FlowReturn`` from ``push_buffer``, or ``None``
         if ``self._appsrc`` is not initialized.
@@ -96,11 +96,11 @@ class AudioBase(ABC):
         buf = Gst.Buffer.new_wrapped(data.tobytes())
         if new_cue:
             buf.set_flags(Gst.BufferFlags.DISCONT)
-            buf.pts = running_time
-            buf.dts = running_time
-            self._appsrc_pts = running_time + duration_ns
-        else:
-            self._appsrc_pts += duration_ns
+            self._appsrc_pts = running_time
+        buf.pts = self._appsrc_pts
+        buf.dts = self._appsrc_pts
+        buf.duration = duration_ns
+        self._appsrc_pts += duration_ns
         return appsrc.push_buffer(buf)
 
     def _on_bus_message(
