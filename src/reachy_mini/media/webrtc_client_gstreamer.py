@@ -34,8 +34,9 @@ Example usage via MediaManager::
 
 """
 
+import json
 import os
-from threading import Thread
+from threading import Event, Thread
 from typing import Iterator, Optional
 
 import requests as _requests
@@ -141,6 +142,8 @@ class GstWebRTCClient(CameraBase, AudioBase):
         self._pipeline_record.add(self._webrtcsrc)
 
         self._webrtcbin = None
+        self._data_channel = None
+        self._incoming_audio_ready = Event()
         self._audio_send_ready = False
         self._appsrc = None
         self.daemon_url: str = ""  # set by MediaManager for remote sound ops
@@ -190,6 +193,30 @@ class GstWebRTCClient(CameraBase, AudioBase):
             self.logger.info(f"Captured webrtcbin: {element.get_name()}")
             self._webrtcbin = element
             element.connect("on-new-transceiver", self._on_new_transceiver)
+            element.connect("on-data-channel", self._on_data_channel)
+
+    def _on_data_channel(self, _webrtcbin: Gst.Element, channel: Gst.Element) -> None:
+        """Receive daemon-side media readiness events."""
+        self._data_channel = channel
+        channel.connect("on-message-string", self._on_data_channel_message)
+        channel.connect("on-close", self._on_data_channel_close)
+
+    def _on_data_channel_message(self, _channel: Gst.Element, message: str) -> None:
+        try:
+            payload = json.loads(message)
+        except (TypeError, ValueError):
+            return
+        if payload.get("event") == "incoming_audio_ready":
+            self._incoming_audio_ready.set()
+            self.logger.info("Daemon incoming audio playback is ready")
+
+    def _on_data_channel_close(self, _channel: Gst.Element) -> None:
+        self._data_channel = None
+        self._incoming_audio_ready.clear()
+
+    def wait_for_incoming_audio_ready(self, timeout: Optional[float] = None) -> bool:
+        """Wait until the daemon can render this client's incoming RTP audio."""
+        return self._incoming_audio_ready.wait(timeout)
 
     def _on_new_transceiver(
         self, webrtcbin: Gst.Element, transceiver: GObject.Object
@@ -349,6 +376,7 @@ class GstWebRTCClient(CameraBase, AudioBase):
 
     def close(self) -> None:
         """Stop the WebRTC pipeline."""
+        self._incoming_audio_ready.clear()
         self._release_jpeg_encoder()
         self._pipeline_record.set_state(Gst.State.NULL)
 

@@ -22,6 +22,7 @@ Example usage::
     >>> # The server is now streaming and ready to accept client connections
 """
 
+import json
 import logging
 import os
 import platform
@@ -592,6 +593,28 @@ class GstMediaServer:
             "pad": pad,
         }
         self._logger.info(f"Audio playback pipeline started for peer {peer_id}")
+        self._notify_incoming_audio_ready(peer_id)
+
+    def _notify_incoming_audio_ready(self, peer_id: str) -> bool:
+        """Acknowledge that incoming RTP can now reach the audio sink."""
+        channel = self._data_channels.get(peer_id)
+        if channel is None:
+            return False
+        try:
+            state = channel.get_property("ready-state")
+            state_name = str(getattr(state, "value_nick", state)).lower()
+            if state_name != "open":
+                return False
+            channel.emit(
+                "send-string",
+                json.dumps({"event": "incoming_audio_ready"}),
+            )
+        except Exception as exc:
+            self._logger.warning(
+                f"Failed to acknowledge incoming audio readiness for {peer_id}: {exc}"
+            )
+            return False
+        return True
 
     def _on_playback_bus_message(
         self, bus: Gst.Bus, msg: Gst.Message, peer_id: str
@@ -1999,6 +2022,8 @@ class GstMediaServer:
 
     def _on_data_channel_open(self, channel: Gst.Element, peer_id: str) -> None:
         self._logger.info(f"Data channel opened for peer {peer_id}")
+        if peer_id in self._incoming_audio:
+            self._notify_incoming_audio_ready(peer_id)
 
     def _on_data_channel_close(self, channel: Gst.Element, peer_id: str) -> None:
         self._logger.info(f"Data channel closed for peer {peer_id}")
