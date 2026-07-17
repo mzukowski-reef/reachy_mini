@@ -92,6 +92,37 @@ def test_webrtc_client_does_not_upscale_to_camera_default() -> None:
     assert caps == "video/x-raw, format=(string)BGR"
 
 
+def test_webrtc_client_buffers_rtp_scheduler_jitter() -> None:
+    """Keep complete keyframe bursts when the local process is descheduled."""
+    client = object.__new__(GstWebRTCClient)
+    client._doa = MagicMock()
+    client._loop = MagicMock()
+    client._bus_record = MagicMock()
+    source = Gst.Bin.new("test-webrtc-source")
+    webrtcbin = Gst.ElementFactory.make("webrtcbin", "webrtcbin0")
+    assert source is not None
+    assert webrtcbin is not None
+    source.add(webrtcbin)
+
+    client._configure_webrtcbin(source)
+
+    assert webrtcbin.get_property("latency") == 200
+
+
+def test_webrtc_vp8_encoder_limits_reference_error_propagation(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """Recover from a damaged VP8 reference without waiting for the default GOP."""
+    server = _make_server(monkeypatch)
+    encoder = Gst.ElementFactory.make("vp8enc")
+    assert encoder is not None
+
+    server._encoder_setup(MagicMock(), "peer-a", "video_0", encoder)
+
+    assert encoder.get_property("keyframe-max-dist") == 30
+    assert int(encoder.get_property("error-resilient")) == 1
+
+
 def test_ipc_client_does_not_upscale_to_camera_default() -> None:
     """Keep the daemon's negotiated geometry in the local IPC client."""
     client = object.__new__(GStreamerCamera)
@@ -115,7 +146,12 @@ def test_video_pipeline_omits_disabled_ipc_branch(monkeypatch) -> None:  # type:
 
     assert pipeline.get_by_name("queue_ipc") is None
     assert pipeline.get_by_name("ipc_videoconvert") is None
-    assert pipeline.get_by_name("queue_webrtc") is not None
+    queue_webrtc = pipeline.get_by_name("queue_webrtc")
+    assert queue_webrtc is not None
+    assert queue_webrtc.get_property("leaky") == 2
+    assert queue_webrtc.get_property("max-size-buffers") == 1
+    assert queue_webrtc.get_property("max-size-bytes") == 0
+    assert queue_webrtc.get_property("max-size-time") == 0
     assert pipeline.get_by_name("video_demand_gate") is not None
     selector = pipeline.get_by_name("video_demand_selector")
     assert selector is not None

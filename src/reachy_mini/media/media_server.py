@@ -164,6 +164,11 @@ class GstMediaServer:
     # tell the encoder to budget for this much loss so it ships redundancy.
     TX_OPUS_FEC_LOSS_PERC = 20
 
+    # Bound how long a damaged VP8 reference can contaminate following frames.
+    # The vp8enc default is 128 frames, which is more than eight seconds at the
+    # 15 FPS processing rate used by local robot clients.
+    TX_VP8_KEYFRAME_INTERVAL_SECONDS = 2
+
     # Name of the appsrc feeding the incoming-audio playback pipeline; used
     # both when building the pipeline and when flushing it (clear_incoming_audio).
     INCOMING_AUDIO_SRC_NAME = "audio_in"
@@ -316,8 +321,9 @@ class GstMediaServer:
 
         webrtcsink.connect("consumer-added", self._consumer_added)
         webrtcsink.connect("consumer-removed", self._consumer_removed)
-        # Tune the auto-created Opus encoder for the mic->phone leg
-        # (in-band FEC). See `_encoder_setup` / `TX_OPUS_FEC_LOSS_PERC`.
+        # Tune auto-created media encoders for loss recovery. See
+        # `_encoder_setup`, `TX_OPUS_FEC_LOSS_PERC`, and
+        # `TX_VP8_KEYFRAME_INTERVAL_SECONDS`.
         webrtcsink.connect("encoder-setup", self._encoder_setup)
 
         pipeline.add(webrtcsink)
@@ -333,13 +339,13 @@ class GstMediaServer:
     ) -> bool:
         """Configure webrtcsink's auto-created encoder before it runs.
 
-        Fired by ``webrtcsink`` once per consumer encoder. We only touch
-        the Opus audio encoder (the robot mic uplink): enable in-band FEC
-        and budget for packet loss so the encoder ships redundancy that
-        the browser can use to reconstruct dropped mic packets instead of
-        merely concealing them. Returning ``False`` keeps webrtcsink's own
-        default configuration (notably its congestion-controlled bitrate),
-        which does not otherwise touch these two properties.
+        Fired by ``webrtcsink`` once per consumer encoder. Opus gets in-band
+        FEC for the robot mic uplink. VP8 gets bounded keyframe spacing and
+        error-resilient coding so one damaged reference frame cannot corrupt
+        the preview until vp8enc's long default GOP eventually ends.
+
+        Returning ``False`` keeps webrtcsink's remaining defaults, notably its
+        bitrate configuration.
         """
         factory = encoder.get_factory()
         factory_name = factory.get_name() if factory else ""
@@ -353,6 +359,22 @@ class GstMediaServer:
             self._logger.info(
                 f"opusenc tuned for {consumer_id}: inband-fec=True, "
                 f"packet-loss-percentage={self.TX_OPUS_FEC_LOSS_PERC}"
+            )
+        elif factory_name == "vp8enc":
+            keyframe_max_dist = max(
+                1,
+                round(
+                    self.processing_framerate
+                    * self.TX_VP8_KEYFRAME_INTERVAL_SECONDS
+                ),
+            )
+            if encoder.find_property("keyframe-max-dist") is not None:
+                encoder.set_property("keyframe-max-dist", keyframe_max_dist)
+            if encoder.find_property("error-resilient") is not None:
+                encoder.set_property("error-resilient", 1)
+            self._logger.info(
+                f"vp8enc tuned for {consumer_id}: "
+                f"keyframe-max-dist={keyframe_max_dist}, error-resilient=default"
             )
         return False
 
@@ -953,6 +975,13 @@ class GstMediaServer:
 
         # WebRTC branch
         queue_webrtc = Gst.ElementFactory.make("queue", "queue_webrtc")
+        # Live video must never build a stale-frame backlog when encoding or
+        # scheduling falls behind. Keep only the newest frame and recover by
+        # dropping video rather than starving audio and control processing.
+        queue_webrtc.set_property("leaky", 2)
+        queue_webrtc.set_property("max-size-buffers", 1)
+        queue_webrtc.set_property("max-size-bytes", 0)
+        queue_webrtc.set_property("max-size-time", 0)
         pipeline.add(queue_webrtc)
         tee.link(queue_webrtc)
 

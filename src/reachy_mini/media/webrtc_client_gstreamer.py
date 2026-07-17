@@ -76,6 +76,12 @@ class GstWebRTCClient(CameraBase, AudioBase):
 
     """
 
+    # Ten milliseconds is too small even for localhost when keyframes arrive
+    # as RTP packet bursts or the host is briefly descheduled. Dropping one of
+    # those packets corrupts the VP8 reference chain until a complete keyframe
+    # arrives. Use GStreamer's robust default explicitly.
+    RX_JITTER_LATENCY_MS = 200
+
     def __init__(
         self,
         log_level: str = "INFO",
@@ -280,7 +286,7 @@ class GstWebRTCClient(CameraBase, AudioBase):
             assert webrtcbin is not None, (
                 "Could not find webrtcbin element in webrtcsrc"
             )
-            webrtcbin.set_property("latency", 10)
+            webrtcbin.set_property("latency", self.RX_JITTER_LATENCY_MS)
 
     def _webrtcsrc_pad_added_cb(self, webrtcsrc: Gst.Element, pad: Gst.Pad) -> None:
         self._configure_webrtcbin(webrtcsrc)
