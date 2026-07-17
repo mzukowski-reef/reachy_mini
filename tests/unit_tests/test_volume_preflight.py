@@ -33,6 +33,29 @@ def _linux_control() -> VolumeControlLinux:
     return control
 
 
+def test_linux_alsa_scan_uses_stable_locale_and_separate_commands() -> None:
+    """ALSA discovery should not depend on the daemon process locale."""
+    control = object.__new__(VolumeControlLinux)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert environment["LC_ALL"] == "C"
+        stdout = "card 1: Audio [Reachy Mini Audio], device 0: USB Audio [USB Audio]\n"
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    with patch(
+        "reachy_mini.daemon.app.routers.volume_control_linux.subprocess.run",
+        side_effect=run,
+    ):
+        devices = control._alsa_get_all_devices()
+
+    assert devices == {1: "Reachy Mini Audio"}
+    assert commands == [["aplay", "-l"], ["arecord", "-l"]]
+
+
 def test_linux_preflight_sets_hidden_playback_stage_to_unity() -> None:
     """Linux preflight should force and verify the hidden playback stage."""
     control = _linux_control()
@@ -70,10 +93,7 @@ def test_linux_preflight_rejects_failed_hardware_readback() -> None:
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         if command[-1] == "scontents":
-            stdout = (
-                "Simple mixer control 'PCM',1\n"
-                "  Capabilities: pvolume\n"
-            )
+            stdout = "Simple mixer control 'PCM',1\n  Capabilities: pvolume\n"
         elif "sget" in command:
             stdout = "  Mono: Playback 40 [67%] [-20.00dB]\n"
         else:

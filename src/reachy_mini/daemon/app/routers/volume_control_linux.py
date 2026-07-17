@@ -1,6 +1,7 @@
 """Volume control implementation for Linux systems."""
 
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -25,6 +26,13 @@ except (ImportError, OSError, pulsectl.PulseError):
 
 # Constants
 AUDIO_COMMAND_TIMEOUT = 2  # Timeout in seconds for audio commands
+
+
+def _alsa_command_environment() -> dict[str, str]:
+    """Return a stable locale for parsing ALSA command output."""
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    return environment
 
 
 @dataclass
@@ -299,6 +307,7 @@ class VolumeControlLinux(VolumeControl):
                 text=True,
                 timeout=AUDIO_COMMAND_TIMEOUT,
                 check=True,
+                env=_alsa_command_environment(),
             )
         except (
             subprocess.TimeoutExpired,
@@ -341,6 +350,7 @@ class VolumeControlLinux(VolumeControl):
                 text=True,
                 timeout=AUDIO_COMMAND_TIMEOUT,
                 check=True,
+                env=_alsa_command_environment(),
             )
         except (
             subprocess.TimeoutExpired,
@@ -377,8 +387,7 @@ class VolumeControlLinux(VolumeControl):
             sound_card in device.name.lower() for sound_card in SOUND_CARD_NAMES
         ):
             raise RuntimeError(
-                "Reachy ALSA output card was not found; "
-                f"selected={device.name!r}"
+                f"Reachy ALSA output card was not found; selected={device.name!r}"
             )
 
         controls = self._alsa_get_indexed_controls(
@@ -408,6 +417,7 @@ class VolumeControlLinux(VolumeControl):
                     text=True,
                     timeout=AUDIO_COMMAND_TIMEOUT,
                     check=True,
+                    env=_alsa_command_environment(),
                 )
                 result = subprocess.run(
                     ["amixer", "-c", str(device.id), "sget", selector],
@@ -415,6 +425,7 @@ class VolumeControlLinux(VolumeControl):
                     text=True,
                     timeout=AUDIO_COMMAND_TIMEOUT,
                     check=True,
+                    env=_alsa_command_environment(),
                 )
             except (
                 subprocess.TimeoutExpired,
@@ -427,8 +438,7 @@ class VolumeControlLinux(VolumeControl):
                 ) from error
 
             percentages = [
-                int(value)
-                for value in re.findall(r"\[(\d+)%\]", result.stdout)
+                int(value) for value in re.findall(r"\[(\d+)%\]", result.stdout)
             ]
             if not percentages or any(value != 100 for value in percentages):
                 raise RuntimeError(
@@ -454,21 +464,23 @@ class VolumeControlLinux(VolumeControl):
         """
         devices: dict[int | str, str] = {}
         try:
-            scan_result = subprocess.run(
-                ["aplay", "-l", ";", "arecord", "-l"],
-                capture_output=True,
-                text=True,
-                timeout=AUDIO_COMMAND_TIMEOUT,
-                check=True,
-            )
             pattern = re.compile(r"card\s+(\d+):\s+[^[]+\[([^\]]+)\]")
-            for line in scan_result.stdout.splitlines():
-                match = pattern.search(line)
-                if not match:
-                    continue
-                device_id = int(match.group(1))
-                device_name = match.group(2)
-                devices.setdefault(device_id, device_name)
+            for command in (["aplay", "-l"], ["arecord", "-l"]):
+                scan_result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=AUDIO_COMMAND_TIMEOUT,
+                    check=True,
+                    env=_alsa_command_environment(),
+                )
+                for line in scan_result.stdout.splitlines():
+                    match = pattern.search(line)
+                    if not match:
+                        continue
+                    device_id = int(match.group(1))
+                    device_name = match.group(2)
+                    devices.setdefault(device_id, device_name)
             return devices
         except (
             subprocess.TimeoutExpired,
@@ -585,6 +597,7 @@ class VolumeControlLinux(VolumeControl):
                 timeout=AUDIO_COMMAND_TIMEOUT,
                 check=True,
                 shell=True,
+                env=_alsa_command_environment(),
             )
             for line in result.stdout.splitlines():
                 # TODO: add support for other channels ?
@@ -626,6 +639,7 @@ class VolumeControlLinux(VolumeControl):
                 timeout=AUDIO_COMMAND_TIMEOUT,
                 check=True,
                 shell=True,
+                env=_alsa_command_environment(),
             )
             return True
 
@@ -708,6 +722,7 @@ class VolumeControlLinux(VolumeControl):
                 text=True,
                 timeout=AUDIO_COMMAND_TIMEOUT,
                 check=True,
+                env=_alsa_command_environment(),
             )
             for line in result.stdout.splitlines():
                 if "Simple mixer control" in line:
