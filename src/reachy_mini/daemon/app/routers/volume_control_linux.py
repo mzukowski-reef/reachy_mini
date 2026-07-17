@@ -61,17 +61,15 @@ class VolumeControlLinux(VolumeControl):
     def _get_input_output_devices(self) -> tuple[AudioDevice, AudioDevice]:
         """Get the input and output audio devices corresponding to the Reachy Mini Audio sound card.
 
-        Always finds the ALSA card first to set index-1 controls to 100%,
-        then returns the appropriate devices for the active backend.
+        Always resolves the ALSA card used by the hardware preflight, then
+        returns the appropriate devices for the active global-volume backend.
 
         Returns:
             A tuple of two AudioDevice: (input_device, output_device).
 
         """
-        # Always resolve the ALSA card and initialize the index-1 controls to 100%
         alsa_input, alsa_output = self._alsa_get_input_output_devices()
-        self._initialize_device(alsa_input)
-        self._initialize_device(alsa_output)
+        self._alsa_output_device = alsa_output
 
         if _PULSECTL_AVAILABLE:
             return self._pulse_get_input_output_devices()
@@ -325,30 +323,123 @@ class VolumeControlLinux(VolumeControl):
 
         return controls
 
-    def _initialize_device(self, device: AudioDevice) -> None:
-        """Set all ALSA mixer controls with index 1 to 100% for a given audio device.
+    def _alsa_get_indexed_controls(
+        self,
+        device: AudioDevice,
+        *,
+        index: int,
+        capability: str,
+    ) -> list[str]:
+        """Return mixer controls at an exact index with the given capability."""
+        if device.id is None:
+            return []
 
-        Args:
-            device: The audio device. If its ID is None, uses the default audio device.
-
-        """
-        cmd = self._build_amixer_set_command(device, volume=100, index=1)
         try:
-            subprocess.run(
-                cmd,
+            result = subprocess.run(
+                ["amixer", "-c", str(device.id), "scontents"],
                 capture_output=True,
                 text=True,
                 timeout=AUDIO_COMMAND_TIMEOUT,
                 check=True,
-                shell=True,
             )
         except (
             subprocess.TimeoutExpired,
             FileNotFoundError,
             subprocess.CalledProcessError,
-        ) as e:
-            logger.warning(
-                f"Failed to initialize {device.id} device, amixer failed with error: {e}"
+        ) as error:
+            raise RuntimeError(
+                f"Could not inspect ALSA controls on card {device.id}: {error}"
+            ) from error
+
+        controls: list[str] = []
+        current_control: str | None = None
+        current_index: int | None = None
+        control_pattern = re.compile(r"Simple mixer control '([^']+)',(\d+)")
+        for line in result.stdout.splitlines():
+            match = control_pattern.match(line)
+            if match:
+                current_control = match.group(1)
+                current_index = int(match.group(2))
+                continue
+            if (
+                current_control is not None
+                and current_index == index
+                and capability in line
+                and current_control not in controls
+            ):
+                controls.append(current_control)
+        return controls
+
+    def _set_and_verify_hardware_output_unity(self) -> None:
+        """Set hidden Reachy playback stages to unity and verify the result."""
+        device = self._alsa_output_device
+        if device.id is None or not any(
+            sound_card in device.name.lower() for sound_card in SOUND_CARD_NAMES
+        ):
+            raise RuntimeError(
+                "Reachy ALSA output card was not found; "
+                f"selected={device.name!r}"
+            )
+
+        controls = self._alsa_get_indexed_controls(
+            device,
+            index=1,
+            capability="pvolume",
+        )
+        if not controls:
+            raise RuntimeError(
+                "Reachy hidden ALSA playback control was not found; "
+                f"card={device.id}, expected_index=1"
+            )
+
+        for control in controls:
+            selector = f"{control},1"
+            try:
+                subprocess.run(
+                    [
+                        "amixer",
+                        "-c",
+                        str(device.id),
+                        "sset",
+                        selector,
+                        "100%",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=AUDIO_COMMAND_TIMEOUT,
+                    check=True,
+                )
+                result = subprocess.run(
+                    ["amixer", "-c", str(device.id), "sget", selector],
+                    capture_output=True,
+                    text=True,
+                    timeout=AUDIO_COMMAND_TIMEOUT,
+                    check=True,
+                )
+            except (
+                subprocess.TimeoutExpired,
+                FileNotFoundError,
+                subprocess.CalledProcessError,
+            ) as error:
+                raise RuntimeError(
+                    "Could not initialize Reachy hidden ALSA playback control; "
+                    f"card={device.id}, control={selector}, error={error}"
+                ) from error
+
+            percentages = [
+                int(value)
+                for value in re.findall(r"\[(\d+)%\]", result.stdout)
+            ]
+            if not percentages or any(value != 100 for value in percentages):
+                raise RuntimeError(
+                    "Reachy hidden ALSA playback control verification failed; "
+                    f"card={device.id}, control={selector}, "
+                    f"observed={percentages or 'unreadable'}"
+                )
+            logger.info(
+                "Reachy hardware output stage ready: card=%s, control=%s, volume=100%%",
+                device.id,
+                selector,
             )
 
     def _alsa_get_all_devices(self) -> dict[int | str, str]:
@@ -549,6 +640,11 @@ class VolumeControlLinux(VolumeControl):
             return False
 
     # ---- Public API ----
+
+    def prepare_output_device(self) -> None:
+        """Prepare the Linux hardware stage, then validate global volume."""
+        self._set_and_verify_hardware_output_unity()
+        super().prepare_output_device()
 
     def get_output_volume(self) -> int:
         """Get the output volume.

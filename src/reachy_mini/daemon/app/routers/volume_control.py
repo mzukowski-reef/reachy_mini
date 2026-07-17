@@ -59,6 +59,49 @@ class VolumeControl(ABC):
         """Get the input volume as a value between 0 (minimum volume) and 100 (maximum volume)."""
         pass
 
+    def prepare_output_device(self) -> None:
+        """Validate the Reachy output path without changing its global volume.
+
+        Platform implementations may extend this check for hardware-specific
+        mixer stages. The common check rejects a fallback to the host's default
+        speakers and verifies that the selected global volume control supports
+        a read/write/read round trip.
+        """
+        if not any(
+            sound_card in self.output_device.name.lower()
+            for sound_card in SOUND_CARD_NAMES
+        ):
+            raise RuntimeError(
+                "Reachy audio output device was not selected; "
+                f"selected={self.output_device.name!r}"
+            )
+
+        expected_volume = self.get_output_volume()
+        if not 0 <= expected_volume <= 100:
+            raise RuntimeError(
+                "Could not read Reachy global output volume; "
+                f"device={self.output_device.name!r}, value={expected_volume}"
+            )
+        if not self.set_output_volume(expected_volume):
+            raise RuntimeError(
+                "Could not write Reachy global output volume; "
+                f"device={self.output_device.name!r}, value={expected_volume}"
+            )
+
+        observed_volume = self.get_output_volume()
+        if abs(observed_volume - expected_volume) > 2:
+            raise RuntimeError(
+                "Reachy global output volume verification failed; "
+                f"device={self.output_device.name!r}, expected={expected_volume}, "
+                f"observed={observed_volume}"
+            )
+
+        self.logger.info(
+            "Reachy output device ready: device=%r, global_volume=%d%%",
+            self.output_device.name,
+            observed_volume,
+        )
+
 
 def create_volume_control() -> VolumeControl:
     """Return the correct VolumeControl subclass for the current platform.

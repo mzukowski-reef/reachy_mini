@@ -39,6 +39,7 @@ from reachy_mini.daemon.app.routers import (
     state,
     volume,
 )
+from reachy_mini.daemon.app.routers.volume_control import get_volume_control
 from reachy_mini.daemon.app.startup_app import (
     ensure_startup_app_installed,
     make_startup_app_launcher,
@@ -120,6 +121,13 @@ def _resolve_bind_host(args: Args) -> str:
     return "0.0.0.0" if args.wireless_version else "127.0.0.1"
 
 
+def _prepare_audio_output(args: Args) -> None:
+    """Fail startup when the real robot audio output is not usable."""
+    if args.no_media or args.sim or args.mockup_sim:
+        return
+    get_volume_control().prepare_output_device()
+
+
 def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -176,6 +184,8 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
             )
 
         try:
+            _prepare_audio_output(args)
+
             # Install the startup app (if missing) before waking the robot, so a
             # long download/install doesn't leave it awake and idle. The wireless
             # unit boots asleep (--no-wake-up-on-start), so the app is started by
