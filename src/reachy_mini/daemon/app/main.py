@@ -45,6 +45,7 @@ from reachy_mini.daemon.app.startup_app import (
     make_startup_app_launcher,
     watch_antennas_for_startup_app,
 )
+from reachy_mini.daemon.cpu_profiler import CpuThreadProfiler
 from reachy_mini.daemon.daemon import Daemon
 from reachy_mini.daemon.utils import SimulationMode
 from reachy_mini.media.audio_utils import (
@@ -106,6 +107,8 @@ class Args:
     # over Wi-Fi) and 127.0.0.1 everywhere else. See _resolve_bind_host().
     fastapi_host: str | None = None
     fastapi_port: int = 8000
+    cpu_profile_path: str | None = None
+    cpu_profile_interval: float = 1.0
 
 
 def _resolve_bind_host(args: Args) -> str:
@@ -136,6 +139,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
         """Lifespan context manager for the FastAPI application."""
         args = app.state.args  # type: Args
         dataset_updater_task: asyncio.Task[None] | None = None
+        cpu_profiler: CpuThreadProfiler | None = None
         # Held on app.state so the /apps/startup-app endpoint can re-arm it live.
         app.state.startup_app_antenna_watcher_task = None
 
@@ -168,22 +172,30 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
                 except Exception as e:
                     logger.warning(f"Error in dataset updater: {e}")
 
-        # Pre-download recorded move datasets in background to avoid delays on first play
-        # This runs in asyncio's default ThreadPoolExecutor (fire and forget)
-        if args.preload_datasets:
-            loop = asyncio.get_event_loop()
-            loop.run_in_executor(None, preload_with_logging)
-
-        # Start periodic dataset updater if enabled (interval > 0)
-        if args.dataset_update_interval_hours > 0:
-            dataset_updater_task = asyncio.create_task(
-                dataset_updater(args.dataset_update_interval_hours)
-            )
-            logger.info(
-                f"Dataset updater started (interval: {args.dataset_update_interval_hours}h)"
-            )
-
         try:
+            if args.cpu_profile_path:
+                cpu_profiler = CpuThreadProfiler(
+                    Path(args.cpu_profile_path),
+                    interval_seconds=args.cpu_profile_interval,
+                )
+                cpu_profiler.start()
+                logger.info("Daemon CPU profile: %s", cpu_profiler.output_path)
+
+            # Pre-download recorded move datasets in background to avoid delays on first play
+            # This runs in asyncio's default ThreadPoolExecutor (fire and forget)
+            if args.preload_datasets:
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(None, preload_with_logging)
+
+            # Start periodic dataset updater if enabled (interval > 0)
+            if args.dataset_update_interval_hours > 0:
+                dataset_updater_task = asyncio.create_task(
+                    dataset_updater(args.dataset_update_interval_hours)
+                )
+                logger.info(
+                    f"Dataset updater started (interval: {args.dataset_update_interval_hours}h)"
+                )
+
             _prepare_audio_output(args)
 
             # Install the startup app (if missing) before waking the robot, so a
@@ -239,6 +251,9 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
 
             yield
         finally:
+            if cpu_profiler is not None:
+                cpu_profiler.stop()
+
             # Cancel dataset updater task if running
             if dataset_updater_task and not dataset_updater_task.done():
                 dataset_updater_task.cancel()
@@ -796,6 +811,20 @@ def main() -> None:
         type=str,
         default=default_args.log_file,
         help="Path to a file to write logs to.",
+    )
+    parser.add_argument(
+        "--profile-cpu",
+        dest="cpu_profile_path",
+        type=str,
+        default=default_args.cpu_profile_path,
+        help="Write low-overhead per-thread daemon CPU samples to this JSONL file.",
+    )
+    parser.add_argument(
+        "--profile-cpu-interval",
+        dest="cpu_profile_interval",
+        type=float,
+        default=default_args.cpu_profile_interval,
+        help="Daemon CPU profiling interval in seconds (default: 1.0).",
     )
 
     args = parser.parse_args()
