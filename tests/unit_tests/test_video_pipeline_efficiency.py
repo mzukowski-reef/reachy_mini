@@ -141,6 +141,36 @@ def test_webrtc_client_does_not_upscale_to_camera_default() -> None:
     assert caps == "video/x-raw, format=(string)BGR"
 
 
+def test_webrtc_client_bounds_received_media_backlog() -> None:
+    """Discard stale decoded media before conversion and application delivery."""
+    client = object.__new__(GstWebRTCClient)
+    client._pipeline_record = Gst.Pipeline.new("test-receive-backlog")
+    client._appsink_video = Gst.ElementFactory.make("appsink")
+    client._appsink_audio = Gst.ElementFactory.make("appsink")
+    client._loop = MagicMock()
+    client._bus_record = MagicMock()
+    client._configure_video_sink_caps()
+    client._appsink_video.set_property("drop", True)
+    client._appsink_video.set_property("max-buffers", 1)
+    client._pipeline_record.add(client._appsink_video)
+    source = Gst.ElementFactory.make("fakesrc")
+    assert source is not None
+    client._pipeline_record.add(source)
+    pad = MagicMock()
+    pad.get_name.return_value = "video_0"
+    pad.link.side_effect = source.get_static_pad("src").link
+
+    client._webrtcsrc_pad_added_cb(MagicMock(), pad)
+
+    queue = client._pipeline_record.get_by_name("receive_video_queue")
+    assert queue is not None
+    assert int(queue.get_property("leaky")) == 2
+    assert queue.get_property("max-size-buffers") == 1
+    assert queue.get_property("max-size-bytes") == 0
+    assert queue.get_property("max-size-time") == 0
+    assert queue.get_property("flush-on-eos") is True
+
+
 def test_webrtc_client_buffers_rtp_scheduler_jitter() -> None:
     """Keep complete keyframe bursts when the local process is descheduled."""
     client = object.__new__(GstWebRTCClient)

@@ -120,8 +120,10 @@ class GstWebRTCClient(CameraBase, AudioBase):
             f"audio/x-raw,rate={self.SAMPLE_RATE},channels={self.CHANNELS},format=F32LE,layout=interleaved"
         )
         self._appsink_audio.set_property("caps", caps)
-        self._appsink_audio.set_property("drop", True)  # avoid overflow
-        self._appsink_audio.set_property("max-buffers", 500)
+        self._appsink_audio.set_property("drop", True)
+        # Recognition must stay close to live input. A multi-second backlog
+        # creates a catch-up burst after CPU pressure and delays current sound.
+        self._appsink_audio.set_property("max-buffers", 25)
         self._pipeline_record.add(self._appsink_audio)
 
         if camera_specs is not None:
@@ -291,7 +293,12 @@ class GstWebRTCClient(CameraBase, AudioBase):
     def _webrtcsrc_pad_added_cb(self, webrtcsrc: Gst.Element, pad: Gst.Pad) -> None:
         self._configure_webrtcbin(webrtcsrc)
         if pad.get_name().startswith("video"):
-            queue = Gst.ElementFactory.make("queue")
+            queue = Gst.ElementFactory.make("queue", "receive_video_queue")
+            queue.set_property("leaky", 2)
+            queue.set_property("max-size-buffers", 1)
+            queue.set_property("max-size-bytes", 0)
+            queue.set_property("max-size-time", 0)
+            queue.set_property("flush-on-eos", True)
             videoconvert = Gst.ElementFactory.make("videoconvert")
             videoscale = Gst.ElementFactory.make("videoscale")
             videorate = Gst.ElementFactory.make("videorate")
