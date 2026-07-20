@@ -176,9 +176,9 @@ class GstMediaServer:
     # Name of the appsrc feeding the incoming-audio playback pipeline; used
     # both when building the pipeline and when flushing it (clear_incoming_audio).
     INCOMING_AUDIO_SRC_NAME = "audio_in"
-    INCOMING_AUDIO_MAX_BACKLOG_MS = 120
-    INCOMING_AUDIO_MAX_RTP_PACKETS = 8
-    INCOMING_AUDIO_MAX_LATENESS_MS = 100
+    INCOMING_AUDIO_MAX_BACKLOG_MS = 350
+    INCOMING_AUDIO_MAX_RTP_PACKETS = 20
+    INCOMING_AUDIO_MAX_LATENESS_MS = 300
 
     def __init__(
         self,

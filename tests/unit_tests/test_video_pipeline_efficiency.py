@@ -142,16 +142,16 @@ def test_incoming_audio_pipeline_discards_stale_playback(monkeypatch) -> None:  
     server._configure_incoming_audio_sink(sink)
 
     assert appsrc.get_property("block") is False
-    assert appsrc.get_property("max-buffers") == 8
+    assert appsrc.get_property("max-buffers") == 20
     assert appsrc.get_property("max-bytes") == 0
-    assert appsrc.get_property("max-time") == 120 * Gst.MSECOND
+    assert appsrc.get_property("max-time") == 350 * Gst.MSECOND
     assert int(appsrc.get_property("leaky-type")) == 2
     assert int(queue.get_property("leaky")) == 2
-    assert queue.get_property("max-size-buffers") == 8
+    assert queue.get_property("max-size-buffers") == 20
     assert queue.get_property("max-size-bytes") == 0
-    assert queue.get_property("max-size-time") == 120 * Gst.MSECOND
+    assert queue.get_property("max-size-time") == 350 * Gst.MSECOND
     assert queue.get_property("flush-on-eos") is True
-    assert sink.get_property("max-lateness") == 100 * Gst.MSECOND
+    assert sink.get_property("max-lateness") == 300 * Gst.MSECOND
     assert sink.get_property("qos") is True
 
 
