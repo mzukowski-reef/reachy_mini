@@ -93,8 +93,9 @@ VALVE_DROP_MODE_TRANSFORM_TO_GAP = 2
 VIDEO_TEST_PATTERN_BLACK = 2
 
 # Video is expendable under CPU pressure; audio playback and control are not.
-# Linux applies nice values per thread, so demoting GStreamer video tasks keeps
-# their catch-up work from starving the speaker pipeline.
+# Linux applies scheduling policy and nice values per thread, so demoting
+# GStreamer video tasks keeps their catch-up work from starving the speaker
+# pipeline.
 NONCRITICAL_VIDEO_THREAD_NICE = 10
 
 
@@ -413,7 +414,7 @@ class GstMediaServer:
         *,
         label: str,
     ) -> None:
-        """Lower a non-critical Linux streaming thread on its first buffer."""
+        """Make a non-critical Linux streaming thread yield to realtime work."""
         if platform.system() != "Linux":
             return
         src_pad = element.get_static_pad("src")
@@ -430,6 +431,20 @@ class GstMediaServer:
         ) -> Gst.PadProbeReturn:
             del pad, info, user_data
             thread_id = get_native_id()
+            idle_scheduler_applied = False
+            try:
+                os.sched_setscheduler(
+                    thread_id,
+                    os.SCHED_IDLE,
+                    os.sched_param(0),
+                )
+                idle_scheduler_applied = True
+            except (AttributeError, OSError) as exc:
+                self._logger.warning(
+                    "Could not set %s streaming thread to SCHED_IDLE: %s",
+                    label,
+                    exc,
+                )
             try:
                 os.setpriority(
                     os.PRIO_PROCESS,
@@ -437,9 +452,10 @@ class GstMediaServer:
                     NONCRITICAL_VIDEO_THREAD_NICE,
                 )
                 self._logger.info(
-                    "Lowered %s streaming thread %d to nice=%d",
+                    "Lowered %s streaming thread %d to scheduler=%s nice=%d",
                     label,
                     thread_id,
+                    "idle" if idle_scheduler_applied else "default",
                     NONCRITICAL_VIDEO_THREAD_NICE,
                 )
             except (AttributeError, OSError) as exc:

@@ -87,9 +87,15 @@ def test_noncritical_video_probe_lowers_streaming_thread_priority(monkeypatch) -
     element = MagicMock()
     src_pad = MagicMock()
     element.get_static_pad.return_value = src_pad
+    sched_setscheduler = MagicMock()
     setpriority = MagicMock()
     monkeypatch.setattr(media_server_module.platform, "system", lambda: "Linux")
     monkeypatch.setattr(media_server_module, "get_native_id", lambda: 1234)
+    monkeypatch.setattr(
+        media_server_module.os,
+        "sched_setscheduler",
+        sched_setscheduler,
+    )
     monkeypatch.setattr(media_server_module.os, "setpriority", setpriority)
 
     server._deprioritize_streaming_thread_once(element, label="test-video")
@@ -98,6 +104,11 @@ def test_noncritical_video_probe_lowers_streaming_thread_priority(monkeypatch) -
     probe_type, callback, user_data = src_pad.add_probe.call_args.args
     assert probe_type == Gst.PadProbeType.BUFFER
     assert callback(MagicMock(), MagicMock(), user_data) == Gst.PadProbeReturn.REMOVE
+    sched_setscheduler.assert_called_once_with(
+        1234,
+        media_server_module.os.SCHED_IDLE,
+        media_server_module.os.sched_param(0),
+    )
     setpriority.assert_called_once_with(
         media_server_module.os.PRIO_PROCESS,
         1234,
