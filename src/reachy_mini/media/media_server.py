@@ -168,10 +168,17 @@ class GstMediaServer:
     # The vp8enc default is 128 frames, which is more than eight seconds at the
     # 15 FPS processing rate used by local robot clients.
     TX_VP8_KEYFRAME_INTERVAL_SECONDS = 2
+    TX_VP8_DEADLINE_US = 1
+    TX_VP8_CPU_USED = 8
+    TX_VP8_THREADS = 1
+    TX_VP8_DROPFRAME_THRESHOLD = 30
 
     # Name of the appsrc feeding the incoming-audio playback pipeline; used
     # both when building the pipeline and when flushing it (clear_incoming_audio).
     INCOMING_AUDIO_SRC_NAME = "audio_in"
+    INCOMING_AUDIO_MAX_BACKLOG_MS = 120
+    INCOMING_AUDIO_MAX_RTP_PACKETS = 8
+    INCOMING_AUDIO_MAX_LATENESS_MS = 100
 
     def __init__(
         self,
@@ -364,17 +371,31 @@ class GstMediaServer:
             keyframe_max_dist = max(
                 1,
                 round(
-                    self.processing_framerate
-                    * self.TX_VP8_KEYFRAME_INTERVAL_SECONDS
+                    self.processing_framerate * self.TX_VP8_KEYFRAME_INTERVAL_SECONDS
                 ),
             )
             if encoder.find_property("keyframe-max-dist") is not None:
                 encoder.set_property("keyframe-max-dist", keyframe_max_dist)
             if encoder.find_property("error-resilient") is not None:
                 encoder.set_property("error-resilient", 1)
+            if encoder.find_property("deadline") is not None:
+                encoder.set_property("deadline", self.TX_VP8_DEADLINE_US)
+            if encoder.find_property("cpu-used") is not None:
+                encoder.set_property("cpu-used", self.TX_VP8_CPU_USED)
+            if encoder.find_property("threads") is not None:
+                encoder.set_property("threads", self.TX_VP8_THREADS)
+            if encoder.find_property("dropframe-threshold") is not None:
+                encoder.set_property(
+                    "dropframe-threshold",
+                    self.TX_VP8_DROPFRAME_THRESHOLD,
+                )
             self._logger.info(
                 f"vp8enc tuned for {consumer_id}: "
-                f"keyframe-max-dist={keyframe_max_dist}, error-resilient=default"
+                f"keyframe-max-dist={keyframe_max_dist}, "
+                f"deadline={self.TX_VP8_DEADLINE_US}, "
+                f"cpu-used={self.TX_VP8_CPU_USED}, "
+                f"threads={self.TX_VP8_THREADS}, "
+                f"dropframe-threshold={self.TX_VP8_DROPFRAME_THRESHOLD}"
             )
         return False
 
@@ -507,6 +528,7 @@ class GstMediaServer:
         appsrc.set_property("format", Gst.Format.TIME)
         appsrc.set_property("is-live", True)
         appsrc.set_property("caps", caps)
+        self._configure_incoming_audio_appsrc(appsrc)
 
         rtpopusdepay = Gst.ElementFactory.make("rtpopusdepay")
         opusdec = Gst.ElementFactory.make("opusdec")
@@ -527,18 +549,21 @@ class GstMediaServer:
             self._logger.error("Failed to create audio sink element")
             return
         audiosink.set_property("sync", True)
+        self._configure_incoming_audio_sink(audiosink)
 
         # Per-branch audioconvert+audioresample so the wobbler appsink's
         # F32LE/2/16000 caps don't drag the audiosink branch into a rate
         # the device can't accept (e.g. wireless XMOS PCM falls back to
         # IEC958 at non-native rates).
         tee = Gst.ElementFactory.make("tee")
-        queue_speaker = Gst.ElementFactory.make("queue")
+        queue_speaker = Gst.ElementFactory.make("queue", "playback_speaker")
         ac_speaker = Gst.ElementFactory.make("audioconvert")
         ar_speaker = Gst.ElementFactory.make("audioresample")
-        queue_wobbler = Gst.ElementFactory.make("queue")
+        queue_wobbler = Gst.ElementFactory.make("queue", "playback_wobbler")
         ac_wobbler = Gst.ElementFactory.make("audioconvert")
         ar_wobbler = Gst.ElementFactory.make("audioresample")
+        self._configure_incoming_audio_queue(queue_speaker)
+        self._configure_incoming_audio_queue(queue_wobbler)
 
         appsink_wobbler = self._make_wobbler_appsink()
 
@@ -616,6 +641,38 @@ class GstMediaServer:
         }
         self._logger.info(f"Audio playback pipeline started for peer {peer_id}")
         self._notify_incoming_audio_ready(peer_id)
+
+    def _configure_incoming_audio_appsrc(self, appsrc: Gst.Element) -> None:
+        """Discard stale RTP packets instead of accumulating playback debt."""
+        appsrc.set_property("block", False)
+        appsrc.set_property("max-buffers", self.INCOMING_AUDIO_MAX_RTP_PACKETS)
+        appsrc.set_property("max-bytes", 0)
+        appsrc.set_property(
+            "max-time",
+            self.INCOMING_AUDIO_MAX_BACKLOG_MS * Gst.MSECOND,
+        )
+        appsrc.set_property("leaky-type", 2)
+
+    def _configure_incoming_audio_queue(self, queue: Gst.Element) -> None:
+        """Keep decoded playback close to the live WebRTC clock."""
+        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", self.INCOMING_AUDIO_MAX_RTP_PACKETS)
+        queue.set_property("max-size-bytes", 0)
+        queue.set_property(
+            "max-size-time",
+            self.INCOMING_AUDIO_MAX_BACKLOG_MS * Gst.MSECOND,
+        )
+        queue.set_property("flush-on-eos", True)
+
+    def _configure_incoming_audio_sink(self, audiosink: Gst.Element) -> None:
+        """Drop irrecoverably late audio rather than rendering it in a burst."""
+        if audiosink.find_property("max-lateness") is not None:
+            audiosink.set_property(
+                "max-lateness",
+                self.INCOMING_AUDIO_MAX_LATENESS_MS * Gst.MSECOND,
+            )
+        if audiosink.find_property("qos") is not None:
+            audiosink.set_property("qos", True)
 
     def _notify_incoming_audio_ready(self, peer_id: str) -> bool:
         """Acknowledge that incoming RTP can now reach the audio sink."""

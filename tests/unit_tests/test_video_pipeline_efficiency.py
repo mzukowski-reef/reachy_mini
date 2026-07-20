@@ -121,6 +121,38 @@ def test_webrtc_vp8_encoder_limits_reference_error_propagation(
 
     assert encoder.get_property("keyframe-max-dist") == 30
     assert int(encoder.get_property("error-resilient")) == 1
+    assert encoder.get_property("deadline") == 1
+    assert encoder.get_property("cpu-used") == 8
+    assert encoder.get_property("threads") == 1
+    assert encoder.get_property("dropframe-threshold") == 30
+
+
+def test_incoming_audio_pipeline_discards_stale_playback(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Bound playback debt so CPU starvation cannot trigger catch-up bursts."""
+    server = _make_server(monkeypatch)
+    appsrc = Gst.ElementFactory.make("appsrc")
+    queue = Gst.ElementFactory.make("queue")
+    sink = Gst.ElementFactory.make("fakesink")
+    assert appsrc is not None
+    assert queue is not None
+    assert sink is not None
+
+    server._configure_incoming_audio_appsrc(appsrc)
+    server._configure_incoming_audio_queue(queue)
+    server._configure_incoming_audio_sink(sink)
+
+    assert appsrc.get_property("block") is False
+    assert appsrc.get_property("max-buffers") == 8
+    assert appsrc.get_property("max-bytes") == 0
+    assert appsrc.get_property("max-time") == 120 * Gst.MSECOND
+    assert int(appsrc.get_property("leaky-type")) == 2
+    assert int(queue.get_property("leaky")) == 2
+    assert queue.get_property("max-size-buffers") == 8
+    assert queue.get_property("max-size-bytes") == 0
+    assert queue.get_property("max-size-time") == 120 * Gst.MSECOND
+    assert queue.get_property("flush-on-eos") is True
+    assert sink.get_property("max-lateness") == 100 * Gst.MSECOND
+    assert sink.get_property("qos") is True
 
 
 def test_ipc_client_does_not_upscale_to_camera_default() -> None:

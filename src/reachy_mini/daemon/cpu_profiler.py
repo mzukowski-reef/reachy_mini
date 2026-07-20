@@ -13,6 +13,14 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class _ProcessCounters:
+    user_ticks: int
+    system_ticks: int
+    sampled_monotonic: float
+    sampled_wall: float
+
+
+@dataclass(frozen=True)
 class _ThreadCounters:
     tid: int
     name: str
@@ -24,6 +32,8 @@ class _ThreadCounters:
     wait_ns: int
     voluntary_switches: int
     involuntary_switches: int
+    sampled_monotonic: float
+
 
 class CpuThreadProfiler:
     """Sample the daemon's own Linux scheduler counters into JSONL."""
@@ -69,11 +79,11 @@ class CpuThreadProfiler:
         self._thread = None
 
     def _run(self) -> None:
+        self._lower_current_thread_priority()
         started_wall = time.time()
         started_monotonic = time.monotonic()
         previous_process = self._read_process_cpu()
         previous_threads = self._read_threads()
-        previous_monotonic = started_monotonic
         next_sample = started_monotonic + self.interval_seconds
 
         with self.output_path.open("a", encoding="utf-8", buffering=1) as output:
@@ -89,14 +99,15 @@ class CpuThreadProfiler:
                     "intervalMs": round(self.interval_seconds * 1000.0, 3),
                 },
             )
-            while not self._stop_event.wait(
-                max(0.0, next_sample - time.monotonic())
-            ):
+            while not self._stop_event.wait(max(0.0, next_sample - time.monotonic())):
                 sample_started = time.monotonic()
                 current_process = self._read_process_cpu()
                 current_threads = self._read_threads()
                 sample_finished = time.monotonic()
-                elapsed = sample_started - previous_monotonic
+                elapsed = (
+                    current_process.sampled_monotonic
+                    - previous_process.sampled_monotonic
+                )
                 if elapsed > 0:
                     self._write(
                         output,
@@ -106,20 +117,19 @@ class CpuThreadProfiler:
                             previous_threads,
                             current_threads,
                             elapsed_seconds=elapsed,
-                            wall_time=time.time(),
-                            monotonic_time=sample_started,
+                            wall_time=current_process.sampled_wall,
+                            monotonic_time=current_process.sampled_monotonic,
                             sample_delay_seconds=max(0.0, sample_started - next_sample),
                             scan_duration_seconds=sample_finished - sample_started,
                         ),
                     )
                 previous_process = current_process
                 previous_threads = current_threads
-                previous_monotonic = sample_started
                 next_sample += self.interval_seconds
                 if next_sample <= sample_finished:
-                    skipped = int(
-                        (sample_finished - next_sample) / self.interval_seconds
-                    ) + 1
+                    skipped = (
+                        int((sample_finished - next_sample) / self.interval_seconds) + 1
+                    )
                     next_sample += skipped * self.interval_seconds
 
             self._write(
@@ -135,13 +145,21 @@ class CpuThreadProfiler:
             )
 
     @staticmethod
+    def _lower_current_thread_priority() -> None:
+        """Keep diagnostics from competing with media processing."""
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+        except (AttributeError, OSError):
+            pass
+
+    @staticmethod
     def _write(output: Any, payload: dict[str, Any]) -> None:
         output.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
     def _build_sample(
         self,
-        previous_process: tuple[int, int],
-        current_process: tuple[int, int],
+        previous_process: _ProcessCounters,
+        current_process: _ProcessCounters,
         previous_threads: dict[int, _ThreadCounters],
         current_threads: dict[int, _ThreadCounters],
         *,
@@ -158,17 +176,23 @@ class CpuThreadProfiler:
             old = previous_threads.get(tid)
             if old is None:
                 continue
+            thread_elapsed_seconds = counters.sampled_monotonic - old.sampled_monotonic
+            if thread_elapsed_seconds <= 0:
+                continue
             user_percent = _counter_percent(
                 counters.user_ticks - old.user_ticks,
                 ticks_per_second,
-                elapsed_seconds,
+                thread_elapsed_seconds,
             )
             system_percent = _counter_percent(
                 counters.system_ticks - old.system_ticks,
                 ticks_per_second,
-                elapsed_seconds,
+                thread_elapsed_seconds,
             )
-            cpu_percent = user_percent + system_percent
+            cpu_percent = _runtime_percent(
+                counters.runtime_ns - old.runtime_ns,
+                thread_elapsed_seconds,
+            )
             thread_cpu_percent += cpu_percent
             run_ms = _nanoseconds_delta_ms(counters.runtime_ns, old.runtime_ns)
             wait_ms = _nanoseconds_delta_ms(counters.wait_ns, old.wait_ns)
@@ -196,6 +220,7 @@ class CpuThreadProfiler:
                 "userCpuPercent": round(user_percent, 2),
                 "systemCpuPercent": round(system_percent, 2),
                 "processor": counters.processor,
+                "elapsedMs": round(thread_elapsed_seconds * 1000.0, 3),
                 "runMs": run_ms,
                 "waitMs": wait_ms,
                 "voluntaryContextSwitches": voluntary_switches,
@@ -206,12 +231,12 @@ class CpuThreadProfiler:
             threads.append(thread_payload)
         threads.sort(key=lambda item: (-item["cpuPercent"], item["tid"]))
         process_user_percent = _counter_percent(
-            current_process[0] - previous_process[0],
+            current_process.user_ticks - previous_process.user_ticks,
             ticks_per_second,
             elapsed_seconds,
         )
         process_system_percent = _counter_percent(
-            current_process[1] - previous_process[1],
+            current_process.system_ticks - previous_process.system_ticks,
             ticks_per_second,
             elapsed_seconds,
         )
@@ -241,9 +266,7 @@ class CpuThreadProfiler:
                 ),
                 "threadCount": len(current_threads),
                 "activeThreadCount": len(threads),
-                "newThreadCount": len(
-                    current_threads.keys() - previous_threads.keys()
-                ),
+                "newThreadCount": len(current_threads.keys() - previous_threads.keys()),
                 "exitedThreadCount": len(
                     previous_threads.keys() - current_threads.keys()
                 ),
@@ -251,11 +274,16 @@ class CpuThreadProfiler:
             "threads": threads,
         }
 
-    def _read_process_cpu(self) -> tuple[int, int]:
+    def _read_process_cpu(self) -> _ProcessCounters:
         stat = _parse_task_stat(
             (self.proc_root / "self" / "stat").read_text(encoding="ascii")
         )
-        return stat["user_ticks"], stat["system_ticks"]
+        return _ProcessCounters(
+            user_ticks=stat["user_ticks"],
+            system_ticks=stat["system_ticks"],
+            sampled_monotonic=time.monotonic(),
+            sampled_wall=time.time(),
+        )
 
     def _read_threads(self) -> dict[int, _ThreadCounters]:
         task_root = self.proc_root / "self" / "task"
@@ -271,11 +299,12 @@ class CpuThreadProfiler:
                 stat = _parse_task_stat(
                     (task_path / "stat").read_text(encoding="ascii")
                 )
-                status = _parse_task_status(
-                    (task_path / "status").read_text(encoding="utf-8")
-                )
                 schedstat = _parse_schedstat(
                     (task_path / "schedstat").read_text(encoding="ascii")
+                )
+                sampled_monotonic = time.monotonic()
+                status = _parse_task_status(
+                    (task_path / "status").read_text(encoding="utf-8")
                 )
             except (FileNotFoundError, ProcessLookupError, ValueError):
                 continue
@@ -290,12 +319,19 @@ class CpuThreadProfiler:
                 wait_ns=schedstat[1],
                 voluntary_switches=status[0],
                 involuntary_switches=status[1],
+                sampled_monotonic=sampled_monotonic,
             )
         return result
 
 
-def _counter_percent(delta: int, ticks_per_second: float, elapsed_seconds: float) -> float:
+def _counter_percent(
+    delta: int, ticks_per_second: float, elapsed_seconds: float
+) -> float:
     return max(0.0, delta) / ticks_per_second / elapsed_seconds * 100.0
+
+
+def _runtime_percent(delta_ns: int, elapsed_seconds: float) -> float:
+    return max(0, delta_ns) / 1_000_000_000.0 / elapsed_seconds * 100.0
 
 
 def _nanoseconds_delta_ms(current: int, previous: int) -> float:
@@ -320,9 +356,7 @@ def _parse_task_status(value: str) -> tuple[int, int]:
     counters = {
         key: int(raw_value.strip())
         for key, raw_value in (
-            line.split(":", 1)
-            for line in value.splitlines()
-            if ":" in line
+            line.split(":", 1) for line in value.splitlines() if ":" in line
         )
         if key in {"voluntary_ctxt_switches", "nonvoluntary_ctxt_switches"}
     }
