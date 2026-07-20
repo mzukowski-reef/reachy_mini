@@ -28,7 +28,7 @@ import os
 import platform
 import time
 from dataclasses import dataclass, field
-from threading import Lock, Thread
+from threading import Lock, Thread, get_native_id
 from typing import Any, Callable, Dict, Optional
 
 import gi
@@ -91,6 +91,11 @@ DEFAULT_PROCESSING_SIZE = (1280, 720)
 DEFAULT_PROCESSING_FRAMERATE = 15
 VALVE_DROP_MODE_TRANSFORM_TO_GAP = 2
 VIDEO_TEST_PATTERN_BLACK = 2
+
+# Video is expendable under CPU pressure; audio playback and control are not.
+# Linux applies nice values per thread, so demoting GStreamer video tasks keeps
+# their catch-up work from starving the speaker pipeline.
+NONCRITICAL_VIDEO_THREAD_NICE = 10
 
 
 @dataclass
@@ -389,6 +394,9 @@ class GstMediaServer:
                     "dropframe-threshold",
                     self.TX_VP8_DROPFRAME_THRESHOLD,
                 )
+            self._deprioritize_streaming_thread_once(
+                encoder, label=f"vp8:{consumer_id}"
+            )
             self._logger.info(
                 f"vp8enc tuned for {consumer_id}: "
                 f"keyframe-max-dist={keyframe_max_dist}, "
@@ -398,6 +406,49 @@ class GstMediaServer:
                 f"dropframe-threshold={self.TX_VP8_DROPFRAME_THRESHOLD}"
             )
         return False
+
+    def _deprioritize_streaming_thread_once(
+        self,
+        element: Gst.Element,
+        *,
+        label: str,
+    ) -> None:
+        """Lower a non-critical Linux streaming thread on its first buffer."""
+        if platform.system() != "Linux":
+            return
+        src_pad = element.get_static_pad("src")
+        if src_pad is None:
+            self._logger.warning(
+                "Cannot lower %s priority: element has no static src pad", label
+            )
+            return
+
+        def _lower_priority(
+            pad: Gst.Pad,
+            info: Gst.PadProbeInfo,
+            user_data: None,
+        ) -> Gst.PadProbeReturn:
+            del pad, info, user_data
+            thread_id = get_native_id()
+            try:
+                os.setpriority(
+                    os.PRIO_PROCESS,
+                    thread_id,
+                    NONCRITICAL_VIDEO_THREAD_NICE,
+                )
+                self._logger.info(
+                    "Lowered %s streaming thread %d to nice=%d",
+                    label,
+                    thread_id,
+                    NONCRITICAL_VIDEO_THREAD_NICE,
+                )
+            except (AttributeError, OSError) as exc:
+                self._logger.warning(
+                    "Could not lower %s streaming thread priority: %s", label, exc
+                )
+            return Gst.PadProbeReturn.REMOVE
+
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, _lower_priority, None)
 
     def _consumer_added(
         self,
@@ -1133,6 +1184,7 @@ class GstMediaServer:
         """
         camsrc = Gst.ElementFactory.make("v4l2src")
         camsrc.set_property("device", device_path)
+        camsrc.set_property("do-timestamp", True)
 
         caps_mjpeg = Gst.Caps.from_string(
             f"image/jpeg,width={self.resolution[0]},"
@@ -1142,13 +1194,18 @@ class GstMediaServer:
         capsfilter = Gst.ElementFactory.make("capsfilter")
         capsfilter.set_property("caps", caps_mjpeg)
 
-        queue = Gst.ElementFactory.make("queue")
+        queue = Gst.ElementFactory.make("queue", "source_mjpeg_queue")
         queue.set_property("leaky", 2)
-        queue.set_property("max-size-buffers", 2)
+        queue.set_property("max-size-buffers", 1)
+        queue.set_property("max-size-bytes", 0)
+        queue.set_property("max-size-time", 0)
+        queue.set_property("flush-on-eos", True)
+        self._deprioritize_streaming_thread_once(queue, label="camera-source")
 
         videorate = Gst.ElementFactory.make("videorate", "source_mjpeg_videorate")
         videorate.set_property("drop-only", True)
         videorate.set_property("max-rate", self.processing_framerate)
+        videorate.set_property("qos", True)
 
         limited_caps = Gst.Caps.from_string(
             f"image/jpeg,width={self.resolution[0]},"
@@ -1162,6 +1219,7 @@ class GstMediaServer:
 
         # Discard compressed frames before paying the JPEG decode cost.
         jpegdec = Gst.ElementFactory.make("jpegdec")
+        jpegdec.set_property("qos", True)
         videoscale = Gst.ElementFactory.make("videoscale")
         videoconvert = Gst.ElementFactory.make("videoconvert")
 

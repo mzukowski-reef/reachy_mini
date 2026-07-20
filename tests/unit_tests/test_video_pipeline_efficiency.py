@@ -8,6 +8,8 @@ from unittest.mock import MagicMock
 
 import gi
 
+import reachy_mini.media.media_server as media_server_module
+
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
@@ -59,12 +61,48 @@ def test_v4l2_drops_compressed_frames_before_jpeg_decode(monkeypatch) -> None:  
         "videoscale",
         "videoconvert",
     ]
+    source = elements[0]
+    assert source.get_property("do-timestamp") is True
+    queue = elements[2]
+    assert queue.get_name() == "source_mjpeg_queue"
+    assert int(queue.get_property("leaky")) == 2
+    assert queue.get_property("max-size-buffers") == 1
+    assert queue.get_property("max-size-bytes") == 0
+    assert queue.get_property("max-size-time") == 0
+    assert queue.get_property("flush-on-eos") is True
     limiter = elements[3]
     assert limiter.get_property("drop-only") is True
     assert limiter.get_property("max-rate") == 15
+    assert limiter.get_property("qos") is True
     limited_caps = elements[4].get_property("caps").to_string()
     assert "image/jpeg" in limited_caps
     assert "framerate=(fraction)15/1" in limited_caps
+    decoder = elements[5]
+    assert decoder.get_property("qos") is True
+
+
+def test_noncritical_video_probe_lowers_streaming_thread_priority(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Demote the GStreamer task itself, not the thread building the pipeline."""
+    server = _make_server(monkeypatch)
+    element = MagicMock()
+    src_pad = MagicMock()
+    element.get_static_pad.return_value = src_pad
+    setpriority = MagicMock()
+    monkeypatch.setattr(media_server_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(media_server_module, "get_native_id", lambda: 1234)
+    monkeypatch.setattr(media_server_module.os, "setpriority", setpriority)
+
+    server._deprioritize_streaming_thread_once(element, label="test-video")
+
+    src_pad.add_probe.assert_called_once()
+    probe_type, callback, user_data = src_pad.add_probe.call_args.args
+    assert probe_type == Gst.PadProbeType.BUFFER
+    assert callback(MagicMock(), MagicMock(), user_data) == Gst.PadProbeReturn.REMOVE
+    setpriority.assert_called_once_with(
+        media_server_module.os.PRIO_PROCESS,
+        1234,
+        media_server_module.NONCRITICAL_VIDEO_THREAD_NICE,
+    )
 
 
 def test_shared_raw_stream_uses_processing_geometry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
