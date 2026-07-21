@@ -2,6 +2,7 @@
 
 import time
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -57,6 +58,40 @@ def _make_backend() -> MockupSimBackend:
     backend = MockupSimBackend(use_audio=False)
     backend.current_head_pose = np.eye(4, dtype=np.float64)
     return backend
+
+
+def test_kinematics_update_skips_identical_joint_positions() -> None:
+    """Do not repeat forward kinematics for an unchanged hardware sample."""
+    backend = _make_backend()
+    head_positions = np.zeros(7, dtype=np.float64)
+    antenna_positions = np.ones(2, dtype=np.float64)
+    backend.current_head_joint_positions = head_positions.copy()
+    backend.head_kinematics = SimpleNamespace(
+        fk=mock.Mock(return_value=np.eye(4, dtype=np.float64))
+    )
+
+    backend.update_head_kinematics_model(head_positions, antenna_positions)
+
+    backend.head_kinematics.fk.assert_not_called()
+    np.testing.assert_array_equal(
+        backend.current_antenna_joint_positions,
+        antenna_positions,
+    )
+
+
+def test_kinematics_update_runs_for_changed_joint_positions() -> None:
+    """Recompute the pose as soon as any head joint sample changes."""
+    backend = _make_backend()
+    backend.current_head_joint_positions = np.zeros(7, dtype=np.float64)
+    expected_pose = np.eye(4, dtype=np.float64)
+    backend.head_kinematics = SimpleNamespace(fk=mock.Mock(return_value=expected_pose))
+    changed = np.zeros(7, dtype=np.float64)
+    changed[2] = 1e-12
+
+    backend.update_head_kinematics_model(changed)
+
+    backend.head_kinematics.fk.assert_called_once_with(changed)
+    assert backend.current_head_pose is expected_pose
 
 
 def test_set_head_tracking_command_toggles_tracking() -> None:

@@ -1043,6 +1043,16 @@ class Backend:
         if head_joint_positions is None:
             head_joint_positions = self.get_present_head_joint_positions()
 
+        if antennas_joint_positions is not None:
+            self.current_antenna_joint_positions = antennas_joint_positions
+
+        if (
+            self.current_head_pose is not None
+            and self.current_head_joint_positions is not None
+            and np.array_equal(head_joint_positions, self.current_head_joint_positions)
+        ):
+            return
+
         # Compute the forward kinematics to get the current head pose
         self.current_head_pose = self.head_kinematics.fk(head_joint_positions)
 
@@ -1053,9 +1063,6 @@ class Backend:
 
         # Store the last head joint positions
         self.current_head_joint_positions = head_joint_positions
-
-        if antennas_joint_positions is not None:
-            self.current_antenna_joint_positions = antennas_joint_positions
 
     def set_automatic_body_yaw(self, body_yaw: bool) -> None:
         """Set the automatic body yaw.
