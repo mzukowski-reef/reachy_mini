@@ -6,6 +6,7 @@ It uses the `ReachyMiniMotorController` to communicate with the robot's motors.
 """
 
 import logging
+import os
 import struct
 import time
 from datetime import timedelta
@@ -27,6 +28,10 @@ from reachy_mini.io.protocol import (
 from reachy_mini.utils.hardware_config.parser import parse_yaml_config
 
 from ..abstract import Backend
+
+
+RUNTIME_PROFILE_ENV = "REACHY_MINI_RUNTIME_PROFILE"
+RUNTIME_PROFILE_INTERVAL_SECONDS = 1.0
 
 
 class RobotBackend(Backend):
@@ -135,6 +140,50 @@ class RobotBackend(Backend):
         else:
             self.bmi088 = None
 
+        self._runtime_profile_enabled = os.environ.get(
+            RUNTIME_PROFILE_ENV, ""
+        ).lower() in {"1", "true", "yes", "on"}
+        self._runtime_profile_started_at = time.monotonic()
+        self._runtime_profile_samples: dict[str, list[float]] = {}
+
+    def _profile_stage_started(self) -> int:
+        """Return a stage timestamp only when runtime profiling is enabled."""
+        if not self._runtime_profile_enabled:
+            return 0
+        return time.perf_counter_ns()
+
+    def _profile_stage_finished(self, label: str, started_ns: int) -> None:
+        """Record one stage duration for the next aggregate report."""
+        if not started_ns:
+            return
+        duration_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        self._runtime_profile_samples.setdefault(label, []).append(duration_ms)
+
+    def _flush_runtime_profile(self) -> None:
+        """Log mean, p95 and maximum stage times without per-loop logging."""
+        if not self._runtime_profile_enabled:
+            return
+        now = time.monotonic()
+        if now - self._runtime_profile_started_at < RUNTIME_PROFILE_INTERVAL_SECONDS:
+            return
+
+        summaries: list[str] = []
+        for label, samples in sorted(self._runtime_profile_samples.items()):
+            if not samples:
+                continue
+            ordered = sorted(samples)
+            p95_index = min(len(ordered) - 1, int(0.95 * len(ordered)))
+            summaries.append(
+                f"{label}=n:{len(samples)},mean:{sum(samples) / len(samples):.3f}ms,"
+                f"p95:{ordered[p95_index]:.3f}ms,max:{ordered[-1]:.3f}ms"
+            )
+        self.logger.info(
+            "Robot backend profile: %s",
+            "; ".join(summaries) if summaries else "no stages",
+        )
+        self._runtime_profile_samples.clear()
+        self._runtime_profile_started_at = now
+
     def run(self) -> None:
         """Run the control loop for the robot backend.
 
@@ -168,7 +217,9 @@ class RobotBackend(Backend):
         while not self.should_stop.is_set():
             start_t = time.time()
             self._stats["timestamps"].append(time.time())
+            update_started = self._profile_stage_started()
             self._update()
+            self._profile_stage_finished("update_total", update_started)
             took = time.time() - start_t
 
             sleep_time = period - took
@@ -180,10 +231,12 @@ class RobotBackend(Backend):
 
             next_call_event.clear()
             next_call_event.wait(sleep_time)
+            self._flush_runtime_profile()
 
     def _update(self) -> None:
         assert self.c is not None, "Motor controller not initialized or already closed."
 
+        stage_started = self._profile_stage_started()
         if self._torque_enabled:
             if self._current_head_operation_mode != 0:  # if position control mode
                 if self.target_head_joint_positions is not None:
@@ -216,24 +269,32 @@ class RobotBackend(Backend):
             #         self.c.set_antennas_goal_current(
             #            np.round(self.target_antenna_joint_current, 0).astype(int).tolist()
             #         )
+        self._profile_stage_finished("actuator_output", stage_started)
 
         if (
             self.joint_positions_publisher is not None
             and self.pose_publisher is not None
         ):
             try:
+                stage_started = self._profile_stage_started()
                 head_positions, antenna_positions = self.get_all_joint_positions()
+                self._profile_stage_finished("read_positions", stage_started)
 
                 # Update the head kinematics model with the current head positions
+                stage_started = self._profile_stage_started()
                 self.update_head_kinematics_model(
                     np.array(head_positions),
                     np.array(antenna_positions),
                 )
+                self._profile_stage_finished("forward_kinematics", stage_started)
 
+                stage_started = self._profile_stage_started()
                 self.step_head_tracking()
+                self._profile_stage_finished("head_tracking", stage_started)
 
                 # Update the target head joint positions from IK if necessary
                 # - does nothing if the targets did not change
+                stage_started = self._profile_stage_started()
                 if self.ik_required:
                     try:
                         self.update_target_head_joints_from_ik(
@@ -243,7 +304,9 @@ class RobotBackend(Backend):
                         log_throttling.by_time(self.logger, interval=0.5).warning(
                             f"IK error: {e}"
                         )
+                self._profile_stage_finished("inverse_kinematics", stage_started)
 
+                stage_started = self._profile_stage_started()
                 if not self.is_shutting_down:
                     self.joint_positions_publisher.put(
                         JointPositionsMsg(
@@ -261,6 +324,7 @@ class RobotBackend(Backend):
                         imu_msg = self.get_imu_data()
                         if imu_msg is not None:
                             self.imu_publisher.put(imu_msg)
+                self._profile_stage_finished("publish_state", stage_started)
 
                 self.last_alive = time.time()
 
@@ -280,6 +344,7 @@ class RobotBackend(Backend):
                     )
                     raise e
 
+            stage_started = self._profile_stage_started()
             if time.time() - self.stats_record_t0 > self._stats_record_period:
                 dt = np.diff(self._stats["timestamps"])
                 if len(dt) > 1:
@@ -299,7 +364,9 @@ class RobotBackend(Backend):
                 self._stats["timestamps"].clear()
                 self._stats["nb_error"] = 0
                 self.stats_record_t0 = time.time()
+            self._profile_stage_finished("update_stats", stage_started)
 
+            stage_started = self._profile_stage_started()
             if (
                 time.time() - self.last_hardware_error_check_time
                 > self.hardware_error_check_period
@@ -311,6 +378,7 @@ class RobotBackend(Backend):
                             f"Motor '{motor_name}' hardware errors: {errors}"
                         )
                 self.last_hardware_error_check_time = time.time()
+            self._profile_stage_finished("hardware_errors", stage_started)
 
     def close(self) -> None:
         """Close the motor controller connection and release resources."""
@@ -694,5 +762,4 @@ class RobotBackend(Backend):
 
         result: bytes = bytes(self.c.write_raw_packet(packet))
         return result
-
 
