@@ -90,7 +90,6 @@ IPC_FPS = 10
 DEFAULT_PROCESSING_SIZE = (1280, 720)
 DEFAULT_PROCESSING_FRAMERATE = 15
 VALVE_DROP_MODE_TRANSFORM_TO_GAP = 2
-VALVE_DROP_MODE_FORWARD_STICKY_EVENTS = 1
 VIDEO_TEST_PATTERN_BLACK = 2
 VIDEO_THREAD_NICE = 5
 MEDIA_PROFILE_ENV = "REACHY_MINI_MEDIA_PROFILE"
@@ -1926,12 +1925,12 @@ class GstMediaServer:
         return appsink
 
     def _make_wobbler_valve(self) -> Gst.Element:
-        """Drop audio before wobbler conversion while wobbling is disabled."""
+        """Replace disabled wobbler audio with gaps so its sink stays live."""
         valve = Gst.ElementFactory.make("valve")
         valve.set_property("drop", self._head_wobbler is None)
         valve.set_property(
             "drop-mode",
-            VALVE_DROP_MODE_FORWARD_STICKY_EVENTS,
+            VALVE_DROP_MODE_TRANSFORM_TO_GAP,
         )
         return valve
 

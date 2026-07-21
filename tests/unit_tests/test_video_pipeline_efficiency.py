@@ -283,7 +283,7 @@ def test_disabled_wobbler_drops_audio_before_conversion(monkeypatch) -> None:  #
     valve = server._make_wobbler_valve()
 
     assert valve.get_property("drop") is True
-    assert int(valve.get_property("drop-mode")) == 1
+    assert int(valve.get_property("drop-mode")) == 2
 
 
 def test_wobbler_toggle_updates_live_audio_branches(monkeypatch) -> None:  # type: ignore[no-untyped-def]
