@@ -35,6 +35,11 @@ def _make_server(monkeypatch) -> GstMediaServer:  # type: ignore[no-untyped-def]
     server._video_demand_selector = None
     server._video_camera_pad = None
     server._video_idle_pad = None
+    server._incoming_audio = {}
+    server._playbin_wobbler_valve = None
+    server._head_wobbler = None
+    server._media_profile_enabled = False
+    server._media_profile_source_id = None
     server._loop = MagicMock()
     server._bus_sender = MagicMock()
     server._configure_processing_video()
@@ -57,7 +62,7 @@ def test_v4l2_drops_compressed_frames_before_jpeg_decode(monkeypatch) -> None:  
         "queue",
         "videorate",
         "capsfilter",
-        "jpegdec",
+        "avdec_mjpeg",
         "videoscale",
         "videoconvert",
     ]
@@ -79,10 +84,11 @@ def test_v4l2_drops_compressed_frames_before_jpeg_decode(monkeypatch) -> None:  
     assert "framerate=(fraction)15/1" in limited_caps
     decoder = elements[5]
     assert decoder.get_property("qos") is True
+    assert int(decoder.get_property("lowres")) == 1
 
 
-def test_noncritical_video_probe_lowers_streaming_thread_priority(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Demote the GStreamer task itself, not the thread building the pipeline."""
+def test_video_streaming_threads_use_nice_without_idle_scheduler(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Keep video below inference without an idle scheduling policy."""
     server = _make_server(monkeypatch)
     element = MagicMock()
     src_pad = MagicMock()
@@ -98,22 +104,30 @@ def test_noncritical_video_probe_lowers_streaming_thread_priority(monkeypatch) -
     )
     monkeypatch.setattr(media_server_module.os, "setpriority", setpriority)
 
-    server._deprioritize_streaming_thread_once(element, label="test-video")
+    server._lower_streaming_thread_priority_once(element, label="test-video")
 
     src_pad.add_probe.assert_called_once()
     probe_type, callback, user_data = src_pad.add_probe.call_args.args
     assert probe_type == Gst.PadProbeType.BUFFER
     assert callback(MagicMock(), MagicMock(), user_data) == Gst.PadProbeReturn.REMOVE
-    sched_setscheduler.assert_called_once_with(
-        1234,
-        media_server_module.os.SCHED_IDLE,
-        media_server_module.os.sched_param(0),
-    )
+    sched_setscheduler.assert_not_called()
     setpriority.assert_called_once_with(
         media_server_module.os.PRIO_PROCESS,
         1234,
-        media_server_module.NONCRITICAL_VIDEO_THREAD_NICE,
+        media_server_module.VIDEO_THREAD_NICE,
     )
+
+
+def test_mjpeg_decoder_uses_quarter_resolution_for_480p_processing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Use scaled IDCT instead of decoding the 1080p source at full detail."""
+    server = _make_server(monkeypatch)
+    monkeypatch.setenv("REACHY_MINI_PROCESSING_SIZE", "480x270")
+    server._configure_processing_video()
+
+    decoder = server._build_mjpeg_decoder()
+
+    assert decoder.get_factory().get_name() == "avdec_mjpeg"
+    assert int(decoder.get_property("lowres")) == 2
 
 
 def test_shared_raw_stream_uses_processing_geometry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -139,6 +153,7 @@ def test_webrtc_client_does_not_upscale_to_camera_default() -> None:
 
     caps = client._appsink_video.get_property("caps").to_string()
     assert caps == "video/x-raw, format=(string)BGR"
+    assert client._appsink_video.get_property("sync") is False
 
 
 def test_webrtc_client_bounds_received_media_backlog() -> None:
@@ -169,6 +184,10 @@ def test_webrtc_client_bounds_received_media_backlog() -> None:
     assert queue.get_property("max-size-bytes") == 0
     assert queue.get_property("max-size-time") == 0
     assert queue.get_property("flush-on-eos") is True
+    assert all(
+        element.get_factory().get_name() != "videorate"
+        for element in client._iterate_gst(client._pipeline_record.iterate_elements())
+    )
 
 
 def test_webrtc_client_buffers_rtp_scheduler_jitter() -> None:
@@ -206,6 +225,29 @@ def test_webrtc_vp8_encoder_limits_reference_error_propagation(
     assert encoder.get_property("dropframe-threshold") == 30
 
 
+def test_webrtc_opus_encoder_is_profiled_with_a_stable_thread_label(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """Attribute the internal audio encoder cost instead of reporting audio_0."""
+    server = _make_server(monkeypatch)
+    encoder = Gst.ElementFactory.make("opusenc")
+    assert encoder is not None
+    server._label_streaming_thread_once = MagicMock()
+    server._profile_media_pad = MagicMock()
+
+    server._encoder_setup(MagicMock(), "peer-a", "audio_0", encoder)
+
+    assert encoder.get_property("complexity") == server.TX_OPUS_COMPLEXITY
+    server._label_streaming_thread_once.assert_called_once_with(
+        encoder,
+        label="opus:peer-a",
+    )
+    server._profile_media_pad.assert_called_once_with(
+        encoder,
+        label="opus_encoded",
+    )
+
+
 def test_incoming_audio_pipeline_discards_stale_playback(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Bound playback debt so CPU starvation cannot trigger catch-up bursts."""
     server = _make_server(monkeypatch)
@@ -232,6 +274,35 @@ def test_incoming_audio_pipeline_discards_stale_playback(monkeypatch) -> None:  
     assert queue.get_property("flush-on-eos") is True
     assert sink.get_property("max-lateness") == 300 * Gst.MSECOND
     assert sink.get_property("qos") is True
+
+
+def test_disabled_wobbler_drops_audio_before_conversion(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Avoid convert/resample work while daemon-side wobbling is disabled."""
+    server = _make_server(monkeypatch)
+
+    valve = server._make_wobbler_valve()
+
+    assert valve.get_property("drop") is True
+    assert int(valve.get_property("drop-mode")) == 1
+
+
+def test_wobbler_toggle_updates_live_audio_branches(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Open and close all existing wobbler gates without pipeline rebuilds."""
+    server = _make_server(monkeypatch)
+    playbin_valve = server._make_wobbler_valve()
+    incoming_valve = server._make_wobbler_valve()
+    server._playbin_wobbler_valve = playbin_valve
+    server._incoming_audio = {
+        "peer": {"wobbler_valve": incoming_valve},
+    }
+
+    server._set_wobbler_valves_enabled(True)
+    assert playbin_valve.get_property("drop") is False
+    assert incoming_valve.get_property("drop") is False
+
+    server._set_wobbler_valves_enabled(False)
+    assert playbin_valve.get_property("drop") is True
+    assert incoming_valve.get_property("drop") is True
 
 
 def test_ipc_client_does_not_upscale_to_camera_default() -> None:
@@ -289,7 +360,7 @@ def test_webrtc_demand_gate_wraps_expensive_jpeg_processing(monkeypatch) -> None
         "videorate",
         "capsfilter",
         "valve",
-        "jpegdec",
+        "avdec_mjpeg",
         "videoscale",
         "videoconvert",
     ]

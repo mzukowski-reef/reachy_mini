@@ -29,7 +29,6 @@ from reachy_mini.utils.hardware_config.parser import parse_yaml_config
 
 from ..abstract import Backend
 
-
 RUNTIME_PROFILE_ENV = "REACHY_MINI_RUNTIME_PROFILE"
 RUNTIME_PROFILE_INTERVAL_SECONDS = 1.0
 

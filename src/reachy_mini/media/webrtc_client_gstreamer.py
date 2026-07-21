@@ -7,7 +7,7 @@ public methods as ``GStreamerCamera`` and ``GStreamerAudio`` so that
 
 Video pipeline (receive)::
 
-    webrtcsrc pad → queue → videoconvert → videoscale → videorate → appsink(BGR)
+    webrtcsrc pad → queue → videoconvert → videoscale → appsink(BGR)
 
 Audio pipeline (receive)::
 
@@ -154,6 +154,7 @@ class GstWebRTCClient(CameraBase, AudioBase):
         self._incoming_audio_ready = Event()
         self._audio_send_ready = False
         self._appsrc = None
+        self._audio_keepalive_valve = None
         self.daemon_url: str = ""  # set by MediaManager for remote sound ops
         self._webrtcsrc.connect("deep-element-added", self._on_deep_element_added)
         self.logger.info("GstWebRTCClient initialized (bidirectional audio support)")
@@ -175,6 +176,12 @@ class GstWebRTCClient(CameraBase, AudioBase):
         self._appsink_video.set_property(
             "caps", Gst.Caps.from_string("video/x-raw,format=BGR")
         )
+        # webrtcsrc can release several jitter-buffered frames together. A
+        # clock-synchronised appsink blocks the conversion branch until each
+        # frame's PTS, causing the one-frame queue above it to discard valid
+        # frames even when CPU is idle. The polling API only needs the newest
+        # decoded frame, so appsink must consume bursts immediately.
+        self._appsink_video.set_property("sync", False)
 
     def _configure_webrtcsrc(
         self, signaling_host: str, signaling_port: int, peer_id: str
@@ -301,23 +308,19 @@ class GstWebRTCClient(CameraBase, AudioBase):
             queue.set_property("flush-on-eos", True)
             videoconvert = Gst.ElementFactory.make("videoconvert")
             videoscale = Gst.ElementFactory.make("videoscale")
-            videorate = Gst.ElementFactory.make("videorate")
 
             self._pipeline_record.add(queue)
             self._pipeline_record.add(videoconvert)
             self._pipeline_record.add(videoscale)
-            self._pipeline_record.add(videorate)
             pad.link(queue.get_static_pad("sink"))
 
             queue.link(videoconvert)
             videoconvert.link(videoscale)
-            videoscale.link(videorate)
-            videorate.link(self._appsink_video)
+            videoscale.link(self._appsink_video)
 
             queue.sync_state_with_parent()
             videoconvert.sync_state_with_parent()
             videoscale.sync_state_with_parent()
-            videorate.sync_state_with_parent()
             self._appsink_video.sync_state_with_parent()
 
         elif pad.get_name().startswith("audio"):
@@ -407,7 +410,7 @@ class GstWebRTCClient(CameraBase, AudioBase):
         Builds::
 
             appsrc ─────────┐
-                            ├→ audiomixer → capsfilter → opusenc → rtpopuspay → webrtcbin
+                            ├→ audiomixer → capsfilter → valve → opusenc → rtpopuspay → webrtcbin
             audiotestsrc ───┘
 
         A silent ``audiotestsrc`` keeps the ``audiomixer`` producing a
@@ -492,6 +495,10 @@ class GstWebRTCClient(CameraBase, AudioBase):
             ),
         )
 
+        transport_valve = Gst.ElementFactory.make("valve", "send_transport_valve")
+        transport_valve.set_property("drop", False)
+        transport_valve.set_property("drop-mode", 1)  # forward sticky events
+
         opusenc = Gst.ElementFactory.make("opusenc", "send_opusenc")
         opusenc.set_property("audio-type", "restricted-lowdelay")
         opusenc.set_property("frame-size", 10)
@@ -507,6 +514,7 @@ class GstWebRTCClient(CameraBase, AudioBase):
             silence_queue,
             audiomixer,
             mixer_caps,
+            transport_valve,
             opusenc,
             rtpopuspay,
         )
@@ -528,7 +536,8 @@ class GstWebRTCClient(CameraBase, AudioBase):
         silence.link(silence_queue)
         silence_queue.link(audiomixer)
         audiomixer.link(mixer_caps)
-        mixer_caps.link(opusenc)
+        mixer_caps.link(transport_valve)
+        transport_valve.link(opusenc)
         opusenc.link(rtpopuspay)
 
         src_pad = rtpopuspay.get_static_pad("src")
@@ -542,9 +551,21 @@ class GstWebRTCClient(CameraBase, AudioBase):
             elem.sync_state_with_parent()
 
         self._appsrc = appsrc
+        self._audio_keepalive_valve = transport_valve
         # A live element was added after the pipeline reached PLAYING.
         self._pipeline_record.recalculate_latency()
         self.logger.info("Audio send chain ready (bidirectional audio enabled)")
+
+    def set_audio_keepalive_enabled(self, enabled: bool) -> None:
+        """Keep RTP flowing only until the remote playback path is primed."""
+        valve = self._audio_keepalive_valve
+        if valve is None:
+            raise RuntimeError("Audio send chain is not ready")
+        valve.set_property("drop", not enabled)
+        self.logger.info(
+            "Audio RTP keepalive %s",
+            "enabled" if enabled else "suspended",
+        )
 
     def start_playing(self) -> None:
         """No-op — audio send chain is set up automatically on WebRTC connection."""

@@ -28,7 +28,7 @@ import os
 import platform
 import time
 from dataclasses import dataclass, field
-from threading import Lock, Thread, get_native_id
+from threading import Lock, Thread, current_thread, get_native_id
 from typing import Any, Callable, Dict, Optional
 
 import gi
@@ -90,13 +90,11 @@ IPC_FPS = 10
 DEFAULT_PROCESSING_SIZE = (1280, 720)
 DEFAULT_PROCESSING_FRAMERATE = 15
 VALVE_DROP_MODE_TRANSFORM_TO_GAP = 2
+VALVE_DROP_MODE_FORWARD_STICKY_EVENTS = 1
 VIDEO_TEST_PATTERN_BLACK = 2
-
-# Video is expendable under CPU pressure; audio playback and control are not.
-# Linux applies scheduling policy and nice values per thread, so demoting
-# GStreamer video tasks keeps their catch-up work from starving the speaker
-# pipeline.
-NONCRITICAL_VIDEO_THREAD_NICE = 10
+VIDEO_THREAD_NICE = 5
+MEDIA_PROFILE_ENV = "REACHY_MINI_MEDIA_PROFILE"
+MEDIA_PROFILE_INTERVAL_MS = 1000
 
 
 @dataclass
@@ -169,6 +167,9 @@ class GstMediaServer:
     # the browser decoder, never reconstructed. We enable in-band FEC and
     # tell the encoder to budget for this much loss so it ships redundancy.
     TX_OPUS_FEC_LOSS_PERC = 20
+    # Complexity 5 preserves Opus bitrate, bandwidth, channels, and FEC while
+    # avoiding the disproportionate CPU cost of the default complexity 10.
+    TX_OPUS_COMPLEXITY = 5
 
     # Bound how long a damaged VP8 reference can contaminate following frames.
     # The vp8enc default is 128 frames, which is more than eight seconds at the
@@ -210,6 +211,17 @@ class GstMediaServer:
         self._video_ipc_enabled = video_ipc_enabled
         self._log_level = log_level
         self._sim_mode = sim_mode
+        self._media_profile_enabled = os.environ.get(MEDIA_PROFILE_ENV, "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._media_profile_lock = Lock()
+        self._media_profile_counts: dict[str, int] = {}
+        self._media_profile_previous: dict[str, int] = {}
+        self._media_profile_previous_at = time.monotonic()
+        self._media_profile_source_id: Optional[int] = None
 
         Gst.init([])
         self._loop = GLib.MainLoop()
@@ -273,6 +285,7 @@ class GstMediaServer:
         self._video_idle_pad: Optional[Gst.Pad] = None
         self._incoming_audio: Dict[str, Dict[str, Any]] = {}
         self._playbin: Optional[Gst.Element] = None
+        self._playbin_wobbler_valve: Optional[Gst.Element] = None
         self._head_wobbler: Optional[HeadWobbler] = None
         self._pipeline_playback: Optional[Gst.Pipeline] = None
         # Software AEC: set in _configure_audio; the probe is created there and
@@ -281,6 +294,14 @@ class GstMediaServer:
         self._webrtcechoprobe: Optional[Gst.Element] = None
 
         self._build_pipeline()
+        if self._media_profile_enabled:
+            self._media_profile_source_id = GLib.timeout_add(
+                MEDIA_PROFILE_INTERVAL_MS,
+                self._log_media_profile,
+            )
+            self._logger.info(
+                "Media pipeline profiling enabled with one-second aggregate counters."
+            )
 
     def _build_pipeline(self) -> None:
         """Build (or rebuild) the GStreamer pipeline from scratch."""
@@ -306,8 +327,65 @@ class GstMediaServer:
     def close(self) -> None:
         """Release GStreamer resources (MainLoop, bus watch)."""
         self._logger.debug("Cleaning up GstMediaServer")
+        media_profile_source_id = getattr(self, "_media_profile_source_id", None)
+        if media_profile_source_id is not None:
+            GLib.source_remove(media_profile_source_id)
+            self._media_profile_source_id = None
         self._loop.quit()
         self._bus_sender.remove_watch()
+
+    def _profile_media_pad(
+        self,
+        element: Gst.Element,
+        *,
+        label: str,
+        pad_name: str = "src",
+    ) -> None:
+        """Count buffers at a pipeline boundary without per-buffer logging."""
+        if not self._media_profile_enabled:
+            return
+        pad = element.get_static_pad(pad_name)
+        if pad is None:
+            self._logger.warning(
+                "Cannot profile media boundary %s: %s has no %s pad.",
+                label,
+                element.get_name(),
+                pad_name,
+            )
+            return
+
+        with self._media_profile_lock:
+            self._media_profile_counts.setdefault(label, 0)
+            self._media_profile_previous.setdefault(label, 0)
+
+        def _count_buffer(
+            pad: Gst.Pad,
+            info: Gst.PadProbeInfo,
+            user_data: None,
+        ) -> Gst.PadProbeReturn:
+            del pad, info, user_data
+            with self._media_profile_lock:
+                self._media_profile_counts[label] += 1
+            return Gst.PadProbeReturn.OK
+
+        pad.add_probe(Gst.PadProbeType.BUFFER, _count_buffer, None)
+
+    def _log_media_profile(self) -> bool:
+        """Log aggregate buffer rates for each instrumented media boundary."""
+        now = time.monotonic()
+        with self._media_profile_lock:
+            elapsed = max(1e-6, now - self._media_profile_previous_at)
+            rates = {
+                label: (count - self._media_profile_previous.get(label, 0)) / elapsed
+                for label, count in self._media_profile_counts.items()
+            }
+            self._media_profile_previous = dict(self._media_profile_counts)
+            self._media_profile_previous_at = now
+        formatted = ", ".join(
+            f"{label}={rate:.2f}/s" for label, rate in sorted(rates.items())
+        )
+        self._logger.info("Media pipeline rates: %s", formatted or "no buffers")
+        return True
 
     def __del__(self) -> None:
         """Destructor to ensure gstreamer resources are released."""
@@ -363,14 +441,22 @@ class GstMediaServer:
         factory = encoder.get_factory()
         factory_name = factory.get_name() if factory else ""
         if factory_name == "opusenc":
+            if encoder.find_property("complexity") is not None:
+                encoder.set_property("complexity", self.TX_OPUS_COMPLEXITY)
             if encoder.find_property("inband-fec") is not None:
                 encoder.set_property("inband-fec", True)
             if encoder.find_property("packet-loss-percentage") is not None:
                 encoder.set_property(
                     "packet-loss-percentage", self.TX_OPUS_FEC_LOSS_PERC
                 )
+            self._label_streaming_thread_once(
+                encoder,
+                label=f"opus:{consumer_id}",
+            )
+            self._profile_media_pad(encoder, label="opus_encoded")
             self._logger.info(
-                f"opusenc tuned for {consumer_id}: inband-fec=True, "
+                f"opusenc tuned for {consumer_id}: "
+                f"complexity={self.TX_OPUS_COMPLEXITY}, inband-fec=True, "
                 f"packet-loss-percentage={self.TX_OPUS_FEC_LOSS_PERC}"
             )
         elif factory_name == "vp8enc":
@@ -395,9 +481,10 @@ class GstMediaServer:
                     "dropframe-threshold",
                     self.TX_VP8_DROPFRAME_THRESHOLD,
                 )
-            self._deprioritize_streaming_thread_once(
+            self._lower_streaming_thread_priority_once(
                 encoder, label=f"vp8:{consumer_id}"
             )
+            self._profile_media_pad(encoder, label="vp8_encoded")
             self._logger.info(
                 f"vp8enc tuned for {consumer_id}: "
                 f"keyframe-max-dist={keyframe_max_dist}, "
@@ -408,13 +495,13 @@ class GstMediaServer:
             )
         return False
 
-    def _deprioritize_streaming_thread_once(
+    def _lower_streaming_thread_priority_once(
         self,
         element: Gst.Element,
         *,
         label: str,
     ) -> None:
-        """Make a non-critical Linux streaming thread yield to realtime work."""
+        """Let Linux inference and realtime media outrank expendable video work."""
         if platform.system() != "Linux":
             return
         src_pad = element.get_static_pad("src")
@@ -431,32 +518,14 @@ class GstMediaServer:
         ) -> Gst.PadProbeReturn:
             del pad, info, user_data
             thread_id = get_native_id()
-            idle_scheduler_applied = False
+            current_thread().name = f"reachy-{label}"
             try:
-                os.sched_setscheduler(
-                    thread_id,
-                    os.SCHED_IDLE,
-                    os.sched_param(0),
-                )
-                idle_scheduler_applied = True
-            except (AttributeError, OSError) as exc:
-                self._logger.warning(
-                    "Could not set %s streaming thread to SCHED_IDLE: %s",
-                    label,
-                    exc,
-                )
-            try:
-                os.setpriority(
-                    os.PRIO_PROCESS,
-                    thread_id,
-                    NONCRITICAL_VIDEO_THREAD_NICE,
-                )
+                os.setpriority(os.PRIO_PROCESS, thread_id, VIDEO_THREAD_NICE)
                 self._logger.info(
-                    "Lowered %s streaming thread %d to scheduler=%s nice=%d",
+                    "Lowered %s streaming thread %d to nice=%d",
                     label,
                     thread_id,
-                    "idle" if idle_scheduler_applied else "default",
-                    NONCRITICAL_VIDEO_THREAD_NICE,
+                    VIDEO_THREAD_NICE,
                 )
             except (AttributeError, OSError) as exc:
                 self._logger.warning(
@@ -465,6 +534,32 @@ class GstMediaServer:
             return Gst.PadProbeReturn.REMOVE
 
         src_pad.add_probe(Gst.PadProbeType.BUFFER, _lower_priority, None)
+
+    def _label_streaming_thread_once(
+        self,
+        element: Gst.Element,
+        *,
+        label: str,
+    ) -> None:
+        """Give a GStreamer task a stable name for low-overhead CPU profiling."""
+        src_pad = element.get_static_pad("src")
+        if src_pad is None:
+            self._logger.warning(
+                "Cannot label %s streaming thread: element has no static src pad",
+                label,
+            )
+            return
+
+        def _label_thread(
+            pad: Gst.Pad,
+            info: Gst.PadProbeInfo,
+            user_data: None,
+        ) -> Gst.PadProbeReturn:
+            del pad, info, user_data
+            current_thread().name = f"reachy-{label}"
+            return Gst.PadProbeReturn.REMOVE
+
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, _label_thread, None)
 
     def _consumer_added(
         self,
@@ -599,6 +694,8 @@ class GstMediaServer:
 
         rtpopusdepay = Gst.ElementFactory.make("rtpopusdepay")
         opusdec = Gst.ElementFactory.make("opusdec")
+        self._profile_media_pad(appsrc, label="incoming_rtp")
+        self._profile_media_pad(opusdec, label="incoming_decoded_audio")
         # Wi-Fi resilience on the phone->robot voice leg. The browser
         # encoder emits Opus in-band FEC (a redundant copy of the
         # previous frame piggybacked on the next packet) and ramps it
@@ -627,10 +724,13 @@ class GstMediaServer:
         ac_speaker = Gst.ElementFactory.make("audioconvert")
         ar_speaker = Gst.ElementFactory.make("audioresample")
         queue_wobbler = Gst.ElementFactory.make("queue", "playback_wobbler")
+        valve_wobbler = self._make_wobbler_valve()
         ac_wobbler = Gst.ElementFactory.make("audioconvert")
         ar_wobbler = Gst.ElementFactory.make("audioresample")
         self._configure_incoming_audio_queue(queue_speaker)
         self._configure_incoming_audio_queue(queue_wobbler)
+        self._label_streaming_thread_once(queue_speaker, label="audio-playback")
+        self._label_streaming_thread_once(queue_wobbler, label="audio-wobbler")
 
         appsink_wobbler = self._make_wobbler_appsink()
 
@@ -657,6 +757,7 @@ class GstMediaServer:
             ac_speaker,
             ar_speaker,
             audiosink,
+            valve_wobbler,
             queue_wobbler,
             ac_wobbler,
             ar_wobbler,
@@ -674,7 +775,9 @@ class GstMediaServer:
             queue_speaker.link(ac_speaker)
         ac_speaker.link(ar_speaker)
         ar_speaker.link(audiosink)
-        tee.link(queue_wobbler)
+        self._profile_media_pad(queue_speaker, label="incoming_speaker_audio")
+        tee.link(valve_wobbler)
+        valve_wobbler.link(queue_wobbler)
         queue_wobbler.link(ac_wobbler)
         ac_wobbler.link(ar_wobbler)
         ar_wobbler.link(appsink_wobbler)
@@ -705,6 +808,7 @@ class GstMediaServer:
             "playback_pipeline": self._pipeline_playback,
             "probe_id": probe_id,
             "pad": pad,
+            "wobbler_valve": valve_wobbler,
         }
         self._logger.info(f"Audio playback pipeline started for peer {peer_id}")
         self._notify_incoming_audio_ready(peer_id)
@@ -1085,6 +1189,7 @@ class GstMediaServer:
             pipeline.add(capsfilter_raw)
             last_source.link(capsfilter_raw)
             last_source = capsfilter_raw
+            self._profile_media_pad(last_source, label="pre_tee_raw")
 
         # --- Tee: split into IPC + WebRTC branches ---
         tee = Gst.ElementFactory.make("tee")
@@ -1106,8 +1211,13 @@ class GstMediaServer:
         queue_webrtc.set_property("max-size-buffers", 1)
         queue_webrtc.set_property("max-size-bytes", 0)
         queue_webrtc.set_property("max-size-time", 0)
+        self._lower_streaming_thread_priority_once(
+            queue_webrtc,
+            label="video-webrtc-feed",
+        )
         pipeline.add(queue_webrtc)
         tee.link(queue_webrtc)
+        self._profile_media_pad(queue_webrtc, label="webrtc_raw")
 
         if is_rpi:
             # RPi: use hardware H264 encoder (webrtcsink doesn't have v4l2h264enc)
@@ -1216,8 +1326,8 @@ class GstMediaServer:
         queue.set_property("max-size-bytes", 0)
         queue.set_property("max-size-time", 0)
         queue.set_property("flush-on-eos", True)
-        self._deprioritize_streaming_thread_once(queue, label="camera-source")
-
+        self._lower_streaming_thread_priority_once(queue, label="camera-source")
+        self._profile_media_pad(queue, label="camera_mjpeg")
         videorate = Gst.ElementFactory.make("videorate", "source_mjpeg_videorate")
         videorate.set_property("drop-only", True)
         videorate.set_property("max-rate", self.processing_framerate)
@@ -1232,10 +1342,11 @@ class GstMediaServer:
             "capsfilter", "source_mjpeg_limited_caps"
         )
         limited_capsfilter.set_property("caps", limited_caps)
+        self._profile_media_pad(limited_capsfilter, label="limited_mjpeg")
 
         # Discard compressed frames before paying the JPEG decode cost.
-        jpegdec = Gst.ElementFactory.make("jpegdec")
-        jpegdec.set_property("qos", True)
+        jpegdec = self._build_mjpeg_decoder()
+        self._profile_media_pad(jpegdec, label="decoded_raw")
         videoscale = Gst.ElementFactory.make("videoscale")
         videoconvert = Gst.ElementFactory.make("videoconvert")
 
@@ -1253,6 +1364,42 @@ class GstMediaServer:
         if not all(elements):
             raise RuntimeError("Failed to create V4L2 video source elements")
         return elements
+
+    def _build_mjpeg_decoder(self) -> Gst.Element:
+        """Decode no more JPEG detail than the processing stream can preserve."""
+        source_width, source_height = self.resolution
+        target_width, target_height = self.processing_resolution
+        lowres = 0
+        for candidate, divisor in ((2, 4), (1, 2)):
+            if (
+                source_width // divisor >= target_width
+                and source_height // divisor >= target_height
+            ):
+                lowres = candidate
+                break
+
+        decoder = Gst.ElementFactory.make("avdec_mjpeg")
+        if decoder is not None:
+            decoder.set_property("lowres", lowres)
+            decoder.set_property("qos", True)
+            self._logger.info(
+                "MJPEG decoder uses scaled IDCT lowres=%d for %dx%d -> %dx%d.",
+                lowres,
+                source_width,
+                source_height,
+                target_width,
+                target_height,
+            )
+            return decoder
+
+        decoder = Gst.ElementFactory.make("jpegdec")
+        if decoder is None:
+            raise RuntimeError("Failed to create an MJPEG decoder")
+        decoder.set_property("qos", True)
+        self._logger.warning(
+            "avdec_mjpeg is unavailable; falling back to full-resolution jpegdec."
+        )
+        return decoder
 
     def _build_windows_source(self, device_name: str) -> list[Gst.Element]:
         """Build source chain for Windows Media Foundation camera.
@@ -1506,6 +1653,7 @@ class GstMediaServer:
             return
 
         queue = Gst.ElementFactory.make("queue", "queue_audiosrc")
+        self._label_streaming_thread_once(queue, label="audio-capture")
         pipeline.add(audiosrc)
         pipeline.add(queue)
 
@@ -1777,6 +1925,26 @@ class GstMediaServer:
         appsink.connect("new-sample", self._on_wobbler_sample)
         return appsink
 
+    def _make_wobbler_valve(self) -> Gst.Element:
+        """Drop audio before wobbler conversion while wobbling is disabled."""
+        valve = Gst.ElementFactory.make("valve")
+        valve.set_property("drop", self._head_wobbler is None)
+        valve.set_property(
+            "drop-mode",
+            VALVE_DROP_MODE_FORWARD_STICKY_EVENTS,
+        )
+        return valve
+
+    def _set_wobbler_valves_enabled(self, enabled: bool) -> None:
+        """Toggle every live wobbler branch without rebuilding pipelines."""
+        drop = not enabled
+        if self._playbin_wobbler_valve is not None:
+            self._playbin_wobbler_valve.set_property("drop", drop)
+        for info in self._incoming_audio.values():
+            valve = info.get("wobbler_valve")
+            if valve is not None:
+                valve.set_property("drop", drop)
+
     def _on_wobbler_sample(self, appsink: Gst.Element) -> Gst.FlowReturn:
         """GStreamer callback: forward audio buffer to the head wobbler.
 
@@ -1814,6 +1982,7 @@ class GstMediaServer:
         ar_speaker = Gst.ElementFactory.make("audioresample")
         audiosink = self._build_audiosink_element()
         queue_wobbler = Gst.ElementFactory.make("queue")
+        valve_wobbler = self._make_wobbler_valve()
         ac_wobbler = Gst.ElementFactory.make("audioconvert")
         ar_wobbler = Gst.ElementFactory.make("audioresample")
         appsink_wobbler = self._make_wobbler_appsink()
@@ -1824,6 +1993,7 @@ class GstMediaServer:
             ac_speaker,
             ar_speaker,
             audiosink,
+            valve_wobbler,
             queue_wobbler,
             ac_wobbler,
             ar_wobbler,
@@ -1836,13 +2006,15 @@ class GstMediaServer:
         ac_speaker.link(ar_speaker)
         ar_speaker.link(audiosink)
 
-        tee.link(queue_wobbler)
+        tee.link(valve_wobbler)
+        valve_wobbler.link(queue_wobbler)
         queue_wobbler.link(ac_wobbler)
         ac_wobbler.link(ar_wobbler)
         ar_wobbler.link(appsink_wobbler)
 
         ghost_pad = Gst.GhostPad.new("sink", tee.get_static_pad("sink"))
         audio_bin.add_pad(ghost_pad)
+        self._playbin_wobbler_valve = valve_wobbler
 
         return audio_bin
 
@@ -1857,6 +2029,7 @@ class GstMediaServer:
         if self._head_wobbler is not None:
             self._head_wobbler.stop()
         self._head_wobbler = HeadWobbler(callback, sample_rate=self.WOBBLER_SAMPLE_RATE)
+        self._set_wobbler_valves_enabled(True)
         self._logger.info("Head wobbler enabled (daemon-side)")
 
     def disable_wobbling(self) -> None:
@@ -1864,6 +2037,7 @@ class GstMediaServer:
         if self._head_wobbler is not None:
             self._head_wobbler.stop()
             self._head_wobbler = None
+            self._set_wobbler_valves_enabled(False)
             self._logger.info("Head wobbler disabled (daemon-side)")
 
     def set_message_handler(
