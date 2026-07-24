@@ -1506,8 +1506,11 @@ class GstMediaServer:
             return
 
         queue = Gst.ElementFactory.make("queue", "queue_audiosrc")
+        capture_chain = self._make_audio_capture_caps_chain()
         pipeline.add(audiosrc)
         pipeline.add(queue)
+        for element in capture_chain:
+            pipeline.add(element)
 
         # Software AEC on the autoaudiosrc fallback (no Reachy Mini card → no
         # XMOS hardware AEC). webrtcdsp subtracts the far-end reference captured
@@ -1547,9 +1550,38 @@ class GstMediaServer:
         else:
             audiosrc.link(queue)
 
+        queue.link(capture_chain[0])
+        for upstream, downstream in zip(capture_chain, capture_chain[1:]):
+            upstream.link(downstream)
+
         # Link into webrtcsink last, once the full upstream chain exists, so its
         # request pad / stream discovery sees a fully-linked input.
-        queue.link(webrtcsink)
+        capture_chain[-1].link(webrtcsink)
+
+    def _make_audio_capture_caps_chain(self) -> list[Gst.Element]:
+        """Normalize captured audio before handing it to ``webrtcsink``.
+
+        Platform sources do not necessarily produce the format selected by
+        ``webrtcsink``. In particular, the Reachy Mini WASAPI endpoint exposes
+        native S16LE audio while ``webrtcsink`` negotiates F32LE. Linking the
+        source directly lets those caps propagate all the way to
+        ``wasapi2src`` without an element that converts the samples.
+
+        Keep the WebRTC boundary explicit and platform-independent:
+        ``audioconvert → audioresample → F32LE/16 kHz/stereo``.
+        """
+        audioconvert = Gst.ElementFactory.make("audioconvert", "capture_audioconvert")
+        audioresample = Gst.ElementFactory.make(
+            "audioresample", "capture_audioresample"
+        )
+        capsfilter = Gst.ElementFactory.make("capsfilter", "capture_audio_caps")
+        capsfilter.set_property(
+            "caps",
+            Gst.Caps.from_string(
+                "audio/x-raw,format=F32LE,rate=16000,channels=2,layout=interleaved"
+            ),
+        )
+        return [audioconvert, audioresample, capsfilter]
 
     def _make_aec_caps_chain(self) -> list[Gst.Element]:
         """Build the convert/resample/caps chain feeding an AEC element.

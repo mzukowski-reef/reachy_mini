@@ -97,6 +97,25 @@ def test_aec_rate_is_a_supported_webrtc_rate() -> None:
     assert AEC_RATE in (8_000, 16_000, 32_000, 48_000)
 
 
+def test_make_audio_capture_caps_chain_emits_f32le_16k_stereo() -> None:
+    """The WebRTC boundary explicitly converts capture audio to stable caps."""
+    server = _make_server()
+
+    chain = GstMediaServer._make_audio_capture_caps_chain(server)
+
+    assert [e.get_factory().get_name() for e in chain] == [
+        "audioconvert",
+        "audioresample",
+        "capsfilter",
+    ]
+    caps = chain[-1].get_property("caps").to_string()
+    assert "audio/x-raw" in caps
+    assert "format=(string)F32LE" in caps
+    assert "rate=(int)16000" in caps
+    assert "channels=(int)2" in caps
+    assert "layout=(string)interleaved" in caps
+
+
 @pytest.mark.skipif(
     not _aec_plugins_available(), reason="webrtcdsp/webrtcechoprobe not installed"
 )
@@ -149,6 +168,11 @@ def test_configure_audio_skips_aec_for_named_card(
 
     assert server._aec_enabled is False
     assert "webrtcdsp" not in _factory_names(pipeline)
+    assert {
+        "audioconvert",
+        "audioresample",
+        "capsfilter",
+    }.issubset(_factory_names(pipeline))
 
 
 def _dsp_start_error(probe_name: str) -> str | None:
