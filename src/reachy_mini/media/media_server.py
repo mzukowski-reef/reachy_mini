@@ -635,13 +635,18 @@ class GstMediaServer:
         appsink_wobbler = self._make_wobbler_appsink()
 
         # Software AEC far-end reference: tap the speaker branch (what is
-        # physically played) with the shared echo probe. opusdec emits S16LE@48k,
-        # which the probe accepts, so no convert/resample is needed. The probe
-        # is reused across peers, so detach it from any previous pipeline first.
+        # physically played) with the shared echo probe. Opus has a 48 kHz RTP
+        # clock, but the decoded PCM rate follows sprop-maxcapturerate and can
+        # therefore be 16 kHz. Normalize it to the DSP's 48 kHz rate explicitly.
+        # The probe is reused across peers, so detach it from any previous
+        # pipeline first.
         # Caveat: there is one probe (webrtcdsp binds a single far-end), so with
         # several peers streaming at once AEC only references the most recently
         # connected one. Fine for the usual single-conversation case.
         webrtcechoprobe = self._webrtcechoprobe if self._aec_enabled else None
+        aec_reference_chain = (
+            self._make_aec_caps_chain() if webrtcechoprobe is not None else []
+        )
         if webrtcechoprobe is not None:
             old_parent = webrtcechoprobe.get_parent()
             if old_parent is not None:
@@ -653,6 +658,7 @@ class GstMediaServer:
             opusdec,
             tee,
             queue_speaker,
+            *aec_reference_chain,
             *([webrtcechoprobe] if webrtcechoprobe is not None else []),
             ac_speaker,
             ar_speaker,
@@ -668,7 +674,13 @@ class GstMediaServer:
         opusdec.link(tee)
         tee.link(queue_speaker)
         if webrtcechoprobe is not None:
-            queue_speaker.link(webrtcechoprobe)
+            queue_speaker.link(aec_reference_chain[0])
+            for upstream, downstream in zip(
+                aec_reference_chain,
+                aec_reference_chain[1:],
+            ):
+                upstream.link(downstream)
+            aec_reference_chain[-1].link(webrtcechoprobe)
             webrtcechoprobe.link(ac_speaker)
         else:
             queue_speaker.link(ac_speaker)
@@ -1512,16 +1524,20 @@ class GstMediaServer:
         for element in capture_chain:
             pipeline.add(element)
 
-        # Software AEC on the autoaudiosrc fallback (no Reachy Mini card → no
-        # XMOS hardware AEC). webrtcdsp subtracts the far-end reference captured
-        # by the paired webrtcechoprobe from the mic signal. The probe must
-        # exist before webrtcdsp starts, so create it here; both elements are
+        # Software AEC on the autoaudiosrc fallback and on Windows. The Windows
+        # shared-mode capture endpoint folds the XMOS stereo output down to two
+        # copies of its left channel, while the XMOS postprocessor also removes
+        # short near-end impulses. Windows therefore captures the raw XMOS
+        # microphones in exclusive mode and cancels only the exact far-end PCM
+        # tapped from the speaker branch below.
+        #
+        # The probe must exist before webrtcdsp starts; both elements are
         # needed, so disable AEC if either is unavailable.
         self._aec_enabled = False
         webrtcdsp = None
         factory = audiosrc.get_factory()
         factory_name = factory.get_name() if factory else ""
-        if factory_name == "autoaudiosrc":
+        if self._should_enable_software_aec(factory_name):
             if self._webrtcechoprobe is None:
                 self._webrtcechoprobe = Gst.ElementFactory.make("webrtcechoprobe")
                 if self._webrtcechoprobe is not None:
@@ -1537,6 +1553,14 @@ class GstMediaServer:
         if webrtcdsp is not None:
             self._aec_enabled = True
             webrtcdsp.set_property("probe", AEC_PROBE_NAME)
+            # Keep this stage strictly scoped to acoustic echo cancellation.
+            # The defaults also enable speech-oriented noise suppression, AGC,
+            # limiting and a high-pass filter, all of which can attenuate
+            # non-speech near-end sounds such as claps.
+            webrtcdsp.set_property("noise-suppression", False)
+            webrtcdsp.set_property("gain-control", False)
+            webrtcdsp.set_property("high-pass-filter", False)
+            webrtcdsp.set_property("limiter", False)
             # webrtcdsp requires S16LE at 8/16/32/48 kHz.
             chain = self._make_aec_caps_chain()
             for el in (*chain, webrtcdsp):
@@ -1546,7 +1570,10 @@ class GstMediaServer:
                 upstream.link(downstream)
             chain[-1].link(webrtcdsp)
             webrtcdsp.link(queue)
-            self._logger.info("No hardware AEC; enabled software echo cancellation.")
+            self._logger.info(
+                "Enabled playback-referenced software echo cancellation "
+                "(noise suppression and gain control disabled)."
+            )
         else:
             audiosrc.link(queue)
 
@@ -1557,6 +1584,18 @@ class GstMediaServer:
         # Link into webrtcsink last, once the full upstream chain exists, so its
         # request pad / stream discovery sees a fully-linked input.
         capture_chain[-1].link(webrtcsink)
+
+    @staticmethod
+    def _should_enable_software_aec(
+        factory_name: str,
+        *,
+        platform_name: str | None = None,
+    ) -> bool:
+        """Use PCM-referenced AEC when hardware AEC is absent or bypassed."""
+        current_platform = platform_name or platform.system()
+        return factory_name == "autoaudiosrc" or (
+            current_platform == "Windows" and factory_name == "wasapi2src"
+        )
 
     def _make_audio_capture_caps_chain(self) -> list[Gst.Element]:
         """Normalize captured audio before handing it to ``webrtcsink``.
@@ -1649,8 +1688,10 @@ class GstMediaServer:
         if id_audio_card is not None:
             if platform.system() == "Windows":
                 audiosrc = Gst.ElementFactory.make("wasapi2src")
-                audiosrc.set_property("device", id_audio_card)
-                self._logger.info(f"Using WASAPI device {id_audio_card} for capture.")
+                self._configure_windows_capture_source(audiosrc, id_audio_card)
+                self._logger.info(
+                    f"Using WASAPI device {id_audio_card} in exclusive mode for capture."
+                )
             elif platform.system() == "Darwin":
                 audiosrc = Gst.ElementFactory.make("osxaudiosrc")
                 audiosrc.set_property("unique-id", id_audio_card)
@@ -1669,6 +1710,15 @@ class GstMediaServer:
             "No Reachy Mini audio card found, using default audio source."
         )
         return Gst.ElementFactory.make("autoaudiosrc")
+
+    @staticmethod
+    def _configure_windows_capture_source(
+        audiosrc: Gst.Element,
+        device_id: str,
+    ) -> None:
+        """Select the Reachy endpoint without Windows shared-mode downmixing."""
+        audiosrc.set_property("device", device_id)
+        audiosrc.set_property("exclusive", True)
 
     def _on_bus_message(
         self, bus: Gst.Bus, msg: Gst.Message, pipeline: Gst.Pipeline

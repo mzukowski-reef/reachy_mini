@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import gi
 import pytest
@@ -147,6 +147,35 @@ def test_configure_audio_enables_aec_on_autoaudiosrc(
     # start) and named so the global registry lookup in webrtcdsp succeeds.
     assert server._webrtcechoprobe is not None
     assert server._webrtcechoprobe.get_name() == AEC_PROBE_NAME
+    assert dsp.get_property("noise-suppression") is False
+    assert dsp.get_property("gain-control") is False
+    assert dsp.get_property("high-pass-filter") is False
+    assert dsp.get_property("limiter") is False
+
+
+def test_software_aec_is_enabled_for_windows_wasapi_capture() -> None:
+    assert GstMediaServer._should_enable_software_aec(
+        "wasapi2src",
+        platform_name="Windows",
+    )
+
+
+def test_software_aec_is_not_enabled_for_named_non_windows_capture() -> None:
+    assert not GstMediaServer._should_enable_software_aec(
+        "pulsesrc",
+        platform_name="Linux",
+    )
+
+
+def test_windows_capture_source_uses_exclusive_mode() -> None:
+    audiosrc = MagicMock()
+
+    GstMediaServer._configure_windows_capture_source(audiosrc, "reachy-input")
+
+    assert audiosrc.set_property.call_args_list == [
+        call("device", "reachy-input"),
+        call("exclusive", True),
+    ]
 
 
 def test_configure_audio_skips_aec_for_named_card(
