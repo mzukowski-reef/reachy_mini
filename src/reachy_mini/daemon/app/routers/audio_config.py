@@ -28,7 +28,7 @@ class AudioParamPair(BaseModel):
     """One ``(parameter_name, values)`` pair in an audio config payload."""
 
     name: str
-    values: list[float]
+    values: list[int | float]
 
 
 class ApplyAudioConfigRequest(BaseModel):

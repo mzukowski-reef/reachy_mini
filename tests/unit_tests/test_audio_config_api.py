@@ -4,6 +4,8 @@ Hits the real ReSpeaker USB board, so each test is gated behind
 `@pytest.mark.audio` like the helpers in `test_audio_control_utils.py`.
 """
 
+from unittest.mock import Mock, patch
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -51,6 +53,40 @@ def test_apply_audio_config_identity_write(client: TestClient) -> None:
     )
     assert response.status_code == 200, response.text
     assert response.json() == {"applied": True}
+
+
+def test_apply_audio_config_preserves_integer_register_values(
+    client: TestClient,
+) -> None:
+    """JSON integers must reach the uint8/int32 USB writer as integers."""
+    respeaker = Mock()
+    respeaker.apply_audio_config.return_value = True
+
+    with patch.object(audio_config, "init_respeaker_usb", return_value=respeaker):
+        response = client.post(
+            "/audio/config/apply",
+            json={
+                "config": [
+                    {"name": "AEC_ASROUTONOFF", "values": [1]},
+                    {"name": "AUDIO_MGR_OP_L", "values": [7, 3]},
+                    {"name": "PP_MIN_NS", "values": [0.15]},
+                ],
+                "verify": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"applied": True}
+    config = respeaker.apply_audio_config.call_args.args[0]
+    assert config == [
+        ("AEC_ASROUTONOFF", [1]),
+        ("AUDIO_MGR_OP_L", [7, 3]),
+        ("PP_MIN_NS", [0.15]),
+    ]
+    assert all(isinstance(value, int) for value in config[0][1])
+    assert all(isinstance(value, int) for value in config[1][1])
+    assert isinstance(config[2][1][0], float)
+    respeaker.close.assert_called_once_with()
 
 
 def test_read_unknown_parameter_returns_404(client: TestClient) -> None:
