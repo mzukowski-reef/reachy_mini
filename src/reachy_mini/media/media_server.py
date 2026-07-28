@@ -52,6 +52,10 @@ from reachy_mini.media.camera_constants import (
 from reachy_mini.media.camera_utils import intrinsics_for_size
 from reachy_mini.media.device_detection import get_audio_device, get_video_device
 from reachy_mini.media.gstreamer_utils import handle_default_bus_message
+from reachy_mini.media.thread_priority import (
+    request_current_thread_high_priority,
+    request_current_thread_realtime,
+)
 from reachy_mini.motion.head_wobbler import HeadWobbler, SpeechOffsets
 from reachy_mini.utils.constants import ASSETS_ROOT_PATH
 
@@ -452,6 +456,7 @@ class GstMediaServer:
                 encoder,
                 label=f"opus:{consumer_id}",
             )
+            self._promote_audio_thread_once(encoder, realtime=True)
             self._profile_media_pad(encoder, label="opus_encoded")
             self._logger.info(
                 f"opusenc tuned for {consumer_id}: "
@@ -559,6 +564,30 @@ class GstMediaServer:
             return Gst.PadProbeReturn.REMOVE
 
         src_pad.add_probe(Gst.PadProbeType.BUFFER, _label_thread, None)
+
+    def _promote_audio_thread_once(
+        self,
+        element: Gst.Element,
+        *,
+        realtime: bool,
+    ) -> None:
+        """Protect a bounded audio task from unrelated CPU saturation."""
+        src_pad = element.get_static_pad("src")
+        if src_pad is None:
+            return
+
+        def _promote(
+            _pad: Gst.Pad,
+            _info: Gst.PadProbeInfo,
+            _user_data: None,
+        ) -> Gst.PadProbeReturn:
+            if realtime:
+                request_current_thread_realtime(5)
+            else:
+                request_current_thread_high_priority(-5)
+            return Gst.PadProbeReturn.REMOVE
+
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, _promote, None)
 
     def _consumer_added(
         self,
@@ -730,6 +759,7 @@ class GstMediaServer:
         self._configure_incoming_audio_queue(queue_wobbler)
         self._label_streaming_thread_once(queue_speaker, label="audio-playback")
         self._label_streaming_thread_once(queue_wobbler, label="audio-wobbler")
+        self._promote_audio_thread_once(queue_speaker, realtime=True)
 
         appsink_wobbler = self._make_wobbler_appsink()
 
@@ -1653,6 +1683,7 @@ class GstMediaServer:
 
         queue = Gst.ElementFactory.make("queue", "queue_audiosrc")
         self._label_streaming_thread_once(queue, label="audio-capture")
+        self._promote_audio_thread_once(queue, realtime=True)
         pipeline.add(audiosrc)
         pipeline.add(queue)
 

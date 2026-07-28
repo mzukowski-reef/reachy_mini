@@ -33,6 +33,8 @@ def test_parse_task_stat_handles_spaces_in_thread_name() -> None:
         "user_ticks": 123,
         "system_ticks": 45,
         "processor": 7,
+        "nice": 0,
+        "scheduler_policy": 0,
     }
 
 
@@ -81,6 +83,7 @@ def test_thread_cpu_uses_each_threads_actual_sampling_interval(tmp_path: Path) -
         current_process,
         {123: previous_thread},
         {123: current_thread},
+        previous_thread_process=previous_process,
         elapsed_seconds=1.0,
         wall_time=101.0,
         monotonic_time=11.0,
@@ -91,13 +94,51 @@ def test_thread_cpu_uses_each_threads_actual_sampling_interval(tmp_path: Path) -
     assert sample["threads"][0]["cpuPercent"] == 75.0
     assert sample["threads"][0]["elapsedMs"] == 2000.0
     assert sample["process"]["threadCpuPercent"] == 75.0
+    assert sample["process"]["threadWindowCpuPercent"] == 0.0
+
+
+def test_process_only_sample_does_not_report_false_thread_zeros(tmp_path: Path) -> None:
+    """Cheap process samples explicitly omit unavailable thread accounting."""
+    profiler = CpuThreadProfiler(tmp_path / "cpu.jsonl")
+    sample = profiler._build_sample(
+        _ProcessCounters(0, 0, 10.0, 100.0),
+        _ProcessCounters(10, 5, 11.0, 101.0),
+        {},
+        None,
+        thread_sample=False,
+        elapsed_seconds=1.0,
+        wall_time=101.0,
+        monotonic_time=11.0,
+        sample_delay_seconds=0.0,
+        scan_duration_seconds=0.001,
+    )
+
+    assert sample["threadSample"] is False
+    assert sample["threads"] == []
+    assert "threadCpuPercent" not in sample["process"]
+
+
+def test_thread_interval_cannot_be_shorter_than_process_interval(
+    tmp_path: Path,
+) -> None:
+    """Thread scans cannot be scheduled more frequently than process samples."""
+    with pytest.raises(ValueError, match="at least the process interval"):
+        CpuThreadProfiler(
+            tmp_path / "cpu.jsonl",
+            interval_seconds=1.0,
+            thread_interval_seconds=0.5,
+        )
 
 
 @pytest.mark.skipif(not Path("/proc/self/task").is_dir(), reason="requires Linux /proc")
 def test_profiler_writes_process_and_thread_samples(tmp_path: Path) -> None:
     """A running profiler emits lifecycle markers and usable CPU samples."""
     output_path = tmp_path / "cpu.jsonl"
-    profiler = CpuThreadProfiler(output_path, interval_seconds=0.02)
+    profiler = CpuThreadProfiler(
+        output_path,
+        interval_seconds=0.02,
+        thread_interval_seconds=0.04,
+    )
 
     profiler.start()
     for _ in range(5):
@@ -111,11 +152,12 @@ def test_profiler_writes_process_and_thread_samples(tmp_path: Path) -> None:
     ]
     samples = [record for record in records if record["kind"] == "cpuSample"]
     assert records[0]["kind"] == "profileStart"
+    assert records[0]["threadIntervalMs"] == 40.0
     assert records[-1]["kind"] == "profileStop"
     assert samples
     assert samples[0]["pid"] == os.getpid()
     assert samples[0]["process"]["cpuPercent"] >= 0
-    assert samples[0]["process"]["threadCount"] >= 1
+    assert any(sample["threadSample"] for sample in samples)
     assert any(
         thread["name"] == "reachy-cpu-profiler"
         for sample in samples

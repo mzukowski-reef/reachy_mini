@@ -36,7 +36,8 @@ Example usage via MediaManager::
 
 import json
 import os
-from threading import Event, Thread
+import platform
+from threading import Event, Thread, get_native_id
 from typing import Iterator, Optional
 
 import requests as _requests
@@ -60,10 +61,14 @@ from reachy_mini.media.camera_constants import (
     ReachyMiniLiteCamSpecs,
 )
 from reachy_mini.media.gstreamer_utils import get_video_sample
+from reachy_mini.media.thread_priority import request_current_thread_realtime
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
 from gi.repository import GLib, GObject, Gst, GstApp  # noqa: E402, F401
+
+
+VIDEO_THREAD_NICE = 5
 
 
 class GstWebRTCClient(CameraBase, AudioBase):
@@ -306,6 +311,7 @@ class GstWebRTCClient(CameraBase, AudioBase):
             queue.set_property("max-size-bytes", 0)
             queue.set_property("max-size-time", 0)
             queue.set_property("flush-on-eos", True)
+            self._lower_video_thread_priority_once(queue)
             videoconvert = Gst.ElementFactory.make("videoconvert")
             videoscale = Gst.ElementFactory.make("videoscale")
 
@@ -341,6 +347,47 @@ class GstWebRTCClient(CameraBase, AudioBase):
             self._setup_audio_send_chain()
 
         GLib.timeout_add_seconds(5, self._dump_latency)
+
+    def _lower_video_thread_priority_once(self, queue: Gst.Element) -> None:
+        """Keep remote video conversion below audio and control scheduling."""
+        if platform.system() != "Linux":
+            return
+        src_pad = queue.get_static_pad("src")
+        if src_pad is None:
+            return
+
+        def _lower_priority(
+            _pad: Gst.Pad,
+            _info: Gst.PadProbeInfo,
+            _user_data: None,
+        ) -> Gst.PadProbeReturn:
+            try:
+                os.setpriority(
+                    os.PRIO_PROCESS,
+                    get_native_id(),
+                    VIDEO_THREAD_NICE,
+                )
+            except (AttributeError, OSError):
+                pass
+            return Gst.PadProbeReturn.REMOVE
+
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, _lower_priority, None)
+
+    def _promote_audio_thread_once(self, queue: Gst.Element) -> None:
+        """Protect the bounded WebRTC audio sender from CPU saturation."""
+        src_pad = queue.get_static_pad("src")
+        if src_pad is None:
+            return
+
+        def _promote(
+            _pad: Gst.Pad,
+            _info: Gst.PadProbeInfo,
+            _user_data: None,
+        ) -> Gst.PadProbeReturn:
+            request_current_thread_realtime(5)
+            return Gst.PadProbeReturn.REMOVE
+
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, _promote, None)
 
     def _on_bus_message(
         self, bus: Gst.Bus, msg: Gst.Message, pipeline: Gst.Pipeline
@@ -469,6 +516,7 @@ class GstWebRTCClient(CameraBase, AudioBase):
         appsrc_queue.set_property("max-size-time", 0)
         appsrc_queue.set_property("max-size-buffers", 0)
         appsrc_queue.set_property("max-size-bytes", 10_000_000)
+        self._promote_audio_thread_once(appsrc_queue)
 
         audioconvert = Gst.ElementFactory.make("audioconvert", "send_ac")
         audioresample = Gst.ElementFactory.make("audioresample", "send_ar")

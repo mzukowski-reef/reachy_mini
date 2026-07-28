@@ -45,13 +45,14 @@ from reachy_mini.daemon.app.startup_app import (
     make_startup_app_launcher,
     watch_antennas_for_startup_app,
 )
-from reachy_mini.daemon.cpu_profiler import CpuThreadProfiler
+from reachy_mini.daemon.cpu_profiler import CpuProfilerProcess
 from reachy_mini.daemon.daemon import Daemon
 from reachy_mini.daemon.utils import SimulationMode
 from reachy_mini.media.audio_utils import (
     check_reachymini_asoundrc,
     write_asoundrc_to_home,
 )
+from reachy_mini.media.thread_priority import request_current_thread_high_priority
 from reachy_mini.motion.recorded_move import preload_default_datasets
 from reachy_mini.utils.discovery import MdnsServiceRegistration
 from reachy_mini.utils.wireless_version.startup_check import (
@@ -109,6 +110,7 @@ class Args:
     fastapi_port: int = 8000
     cpu_profile_path: str | None = None
     cpu_profile_interval: float = 1.0
+    cpu_profile_thread_interval: float = 5.0
 
 
 def _resolve_bind_host(args: Args) -> str:
@@ -139,7 +141,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
         """Lifespan context manager for the FastAPI application."""
         args = app.state.args  # type: Args
         dataset_updater_task: asyncio.Task[None] | None = None
-        cpu_profiler: CpuThreadProfiler | None = None
+        cpu_profiler: CpuProfilerProcess | None = None
         # Held on app.state so the /apps/startup-app endpoint can re-arm it live.
         app.state.startup_app_antenna_watcher_task = None
 
@@ -173,10 +175,12 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
                     logger.warning(f"Error in dataset updater: {e}")
 
         try:
+            request_current_thread_high_priority(-5)
             if args.cpu_profile_path:
-                cpu_profiler = CpuThreadProfiler(
+                cpu_profiler = CpuProfilerProcess(
                     Path(args.cpu_profile_path),
                     interval_seconds=args.cpu_profile_interval,
+                    thread_interval_seconds=args.cpu_profile_thread_interval,
                 )
                 cpu_profiler.start()
                 logger.info("Daemon CPU profile: %s", cpu_profiler.output_path)
@@ -825,6 +829,13 @@ def main() -> None:
         type=float,
         default=default_args.cpu_profile_interval,
         help="Daemon CPU profiling interval in seconds (default: 1.0).",
+    )
+    parser.add_argument(
+        "--profile-cpu-thread-interval",
+        dest="cpu_profile_thread_interval",
+        type=float,
+        default=default_args.cpu_profile_thread_interval,
+        help="Detailed per-thread CPU profiling interval in seconds (default: 5.0).",
     )
 
     args = parser.parse_args()
