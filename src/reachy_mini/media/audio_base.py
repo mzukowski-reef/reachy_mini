@@ -60,12 +60,14 @@ class AudioBase(ABC):
     CHANNELS = 2
     GAP_RESET_NS = 200_000_000  # 200 ms
 
-    def __init__(self, log_level: str = "INFO") -> None:
+    def __init__(
+        self, log_level: str = "INFO", *, initialize_doa: bool = True
+    ) -> None:
         """Initialize shared audio attributes (DoA helper)."""
         Gst.init([])
         self.logger = logging.getLogger(type(self).__module__)
         self.logger.setLevel(log_level)
-        self._doa = AudioDoA()
+        self._doa = AudioDoA() if initialize_doa else None
         # Next expected PTS for the playback / send appsrc; -1 means
         # "no previous buffer, anchor to running-time on next push".
         self._appsrc_pts: int = -1
@@ -170,7 +172,7 @@ class AudioBase(ABC):
             if the device is unavailable.
 
         """
-        return self._doa.get_DoA()
+        return self._doa.get_DoA() if self._doa is not None else None
 
     def apply_audio_config(
         self,
@@ -212,7 +214,8 @@ class AudioBase(ABC):
 
     def cleanup(self) -> None:
         """Release shared resources (DoA USB device)."""
-        self._doa.close()
+        if self._doa is not None:
+            self._doa.close()
 
     @abstractmethod
     def start_recording(self) -> None:
