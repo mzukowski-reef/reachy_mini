@@ -67,7 +67,6 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
 from gi.repository import GLib, GObject, Gst, GstApp  # noqa: E402, F401
 
-
 VIDEO_THREAD_NICE = 5
 
 

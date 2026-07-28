@@ -6,7 +6,6 @@ import os
 import platform
 from threading import get_native_id
 
-
 RTKIT_BUS_NAME = "org.freedesktop.RealtimeKit1"
 RTKIT_OBJECT_PATH = "/org/freedesktop/RealtimeKit1"
 RTKIT_INTERFACE = "org.freedesktop.RealtimeKit1"

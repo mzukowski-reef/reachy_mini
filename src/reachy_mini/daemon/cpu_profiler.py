@@ -406,12 +406,14 @@ class CpuProfilerProcess:
         interval_seconds: float = 1.0,
         thread_interval_seconds: float = 5.0,
     ) -> None:
+        """Configure the external profiler process."""
         self.output_path = output_path.expanduser().absolute()
         self.interval_seconds = interval_seconds
         self.thread_interval_seconds = thread_interval_seconds
         self._process: subprocess.Popen[bytes] | None = None
 
     def start(self) -> None:
+        """Start profiling the current process if no worker is active."""
         if self._process is not None and self._process.poll() is None:
             return
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -436,6 +438,7 @@ class CpuProfilerProcess:
         )
 
     def stop(self) -> None:
+        """Stop the profiler worker and wait for it to exit."""
         process = self._process
         if process is None:
             return
