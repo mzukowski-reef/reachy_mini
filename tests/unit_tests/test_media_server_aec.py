@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import gi
 import pytest
@@ -97,6 +97,25 @@ def test_aec_rate_is_a_supported_webrtc_rate() -> None:
     assert AEC_RATE in (8_000, 16_000, 32_000, 48_000)
 
 
+def test_make_audio_capture_caps_chain_emits_f32le_16k_stereo() -> None:
+    """The WebRTC boundary explicitly converts capture audio to stable caps."""
+    server = _make_server()
+
+    chain = GstMediaServer._make_audio_capture_caps_chain(server)
+
+    assert [e.get_factory().get_name() for e in chain] == [
+        "audioconvert",
+        "audioresample",
+        "capsfilter",
+    ]
+    caps = chain[-1].get_property("caps").to_string()
+    assert "audio/x-raw" in caps
+    assert "format=(string)F32LE" in caps
+    assert "rate=(int)16000" in caps
+    assert "channels=(int)2" in caps
+    assert "layout=(string)interleaved" in caps
+
+
 @pytest.mark.skipif(
     not _aec_plugins_available(), reason="webrtcdsp/webrtcechoprobe not installed"
 )
@@ -128,6 +147,35 @@ def test_configure_audio_enables_aec_on_autoaudiosrc(
     # start) and named so the global registry lookup in webrtcdsp succeeds.
     assert server._webrtcechoprobe is not None
     assert server._webrtcechoprobe.get_name() == AEC_PROBE_NAME
+    assert dsp.get_property("noise-suppression") is False
+    assert dsp.get_property("gain-control") is False
+    assert dsp.get_property("high-pass-filter") is False
+    assert dsp.get_property("limiter") is False
+
+
+def test_software_aec_is_enabled_for_windows_wasapi_capture() -> None:
+    assert GstMediaServer._should_enable_software_aec(
+        "wasapi2src",
+        platform_name="Windows",
+    )
+
+
+def test_software_aec_is_not_enabled_for_named_non_windows_capture() -> None:
+    assert not GstMediaServer._should_enable_software_aec(
+        "pulsesrc",
+        platform_name="Linux",
+    )
+
+
+def test_windows_capture_source_uses_exclusive_mode() -> None:
+    audiosrc = MagicMock()
+
+    GstMediaServer._configure_windows_capture_source(audiosrc, "reachy-input")
+
+    assert audiosrc.set_property.call_args_list == [
+        call("device", "reachy-input"),
+        call("exclusive", True),
+    ]
 
 
 def test_configure_audio_skips_aec_for_named_card(
@@ -149,6 +197,11 @@ def test_configure_audio_skips_aec_for_named_card(
 
     assert server._aec_enabled is False
     assert "webrtcdsp" not in _factory_names(pipeline)
+    assert {
+        "audioconvert",
+        "audioresample",
+        "capsfilter",
+    }.issubset(_factory_names(pipeline))
 
 
 def _dsp_start_error(probe_name: str) -> str | None:
