@@ -16,6 +16,7 @@ import platform
 import re
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
 import gi
@@ -38,6 +39,40 @@ DEFAULT_CAM_NAMES: Sequence[str] = ("Reachy", "Arducam_12MP", "imx708")
 
 # Default target name for audio device detection.
 DEFAULT_AUDIO_TARGET: str = "Reachy Mini Audio"
+
+
+def _is_wsl() -> bool:
+    try:
+        kernel_release = Path("/proc/sys/kernel/osrelease").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        return False
+    return "microsoft" in kernel_release.lower()
+
+
+def _get_wsl_audio_device() -> Optional[str]:
+    try:
+        cards = Path("/proc/asound/cards").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(
+        r"^\s*(\d+)\s+\[[^\]]+\]:.*Reachy Mini Audio",
+        cards,
+        flags=re.MULTILINE,
+    )
+    return f"hw:{match.group(1)}" if match else None
+
+
+def _get_wsl_video_device() -> Tuple[str, Optional[CameraSpecs]]:
+    for name_path in sorted(Path("/sys/class/video4linux").glob("video*/name")):
+        try:
+            display_name = name_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "Reachy Mini Camera" in display_name:
+            return f"/dev/{name_path.parent.name}", ReachyMiniLiteCamSpecs()
+    return "", None
 
 
 @dataclass
@@ -365,6 +400,16 @@ def find_audio_device(
                         device_id,
                     )
                     return device_id
+                # GStreamer 1.28's ALSA device provider exposes alsa.card
+                # instead of device.string on Ubuntu 26.04.
+                if "alsa.card" in props:
+                    device_id = f"hw:{props['alsa.card']}"
+                    _logger.debug(
+                        "Found audio %s device (ALSA card): %s",
+                        device_type,
+                        device_id,
+                    )
+                    return device_id
             case "Windows":
                 if props.get("device.api") != "wasapi2":
                     continue
@@ -443,8 +488,10 @@ def find_video_device(
 
             match current_platform:
                 case "Linux":
-                    if "api.v4l2.path" in props:
-                        device_path = props["api.v4l2.path"]
+                    # GStreamer 1.28 uses device.path; older releases exposed
+                    # the same V4L2 node as api.v4l2.path.
+                    device_path = props.get("api.v4l2.path") or props.get("device.path")
+                    if device_path:
                         _logger.debug("Found %s camera at %s", cam_name, device_path)
                         return device_path, _make_camera_specs(cam_name)
                     elif cam_name == "imx708":
@@ -484,6 +531,18 @@ def get_audio_device(device_type: str = "Source") -> Optional[str]:
         The platform-specific device identifier, or ``None``.
 
     """
+    if _is_wsl():
+        device_id = _get_wsl_audio_device()
+        if device_id:
+            _logger.debug(
+                "Found audio %s device from WSL ALSA: %s",
+                device_type,
+                device_id,
+            )
+        else:
+            _logger.warning("No Reachy Mini Audio %s card found in WSL.", device_type)
+        return device_id
+
     try:
         devices = gst_monitor_devices(f"Audio/{device_type}")
         return find_audio_device(devices, device_type)
@@ -503,6 +562,14 @@ def get_video_device() -> Tuple[str, Optional[CameraSpecs]]:
         ``""`` and ``camera_specs`` is ``None`` when no camera is found.
 
     """
+    if _is_wsl():
+        device_path, specs = _get_wsl_video_device()
+        if device_path:
+            _logger.debug("Found Reachy Mini camera from WSL sysfs: %s", device_path)
+        else:
+            _logger.warning("No Reachy Mini camera found in WSL.")
+        return device_path, specs
+
     try:
         devices = gst_monitor_devices("Video/Source")
         return find_video_device(devices)

@@ -1699,11 +1699,16 @@ class GstMediaServer:
                     f"Using CoreAudio device {id_audio_card} for capture."
                 )
             else:
-                audiosrc = Gst.ElementFactory.make("pulsesrc")
-                audiosrc.set_property("device", f"{id_audio_card}")
-                self._logger.info(
-                    f"Using PulseAudio/PipeWire device {id_audio_card} for capture."
-                )
+                if id_audio_card.startswith("hw:"):
+                    audiosrc = Gst.ElementFactory.make("alsasrc")
+                    audiosrc.set_property("device", id_audio_card)
+                    self._logger.info(f"Using ALSA device {id_audio_card} for capture.")
+                else:
+                    audiosrc = Gst.ElementFactory.make("pulsesrc")
+                    audiosrc.set_property("device", f"{id_audio_card}")
+                    self._logger.info(
+                        f"Using PulseAudio/PipeWire device {id_audio_card} for capture."
+                    )
             return audiosrc
 
         self._logger.warning(
@@ -1830,11 +1835,16 @@ class GstMediaServer:
                     f"Using CoreAudio device {id_audio_card} for playback."
                 )
             else:
-                audiosink = Gst.ElementFactory.make("pulsesink")
-                audiosink.set_property("device", f"{id_audio_card}")
-                self._logger.info(
-                    f"Using PulseAudio/PipeWire device {id_audio_card} for playback."
-                )
+                if id_audio_card.startswith("hw:"):
+                    audiosink = Gst.ElementFactory.make("alsasink")
+                    audiosink.set_property("device", id_audio_card)
+                    self._logger.info(f"Using ALSA device {id_audio_card} for playback.")
+                else:
+                    audiosink = Gst.ElementFactory.make("pulsesink")
+                    audiosink.set_property("device", f"{id_audio_card}")
+                    self._logger.info(
+                        f"Using PulseAudio/PipeWire device {id_audio_card} for playback."
+                    )
             return audiosink
 
         return Gst.ElementFactory.make("autoaudiosink")

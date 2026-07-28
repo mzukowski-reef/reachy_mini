@@ -103,7 +103,9 @@ class GstWebRTCClient(CameraBase, AudioBase):
 
         """
         CameraBase.__init__(self, log_level=log_level)
-        AudioBase.__init__(self, log_level=log_level)
+        # A network client must not probe the local machine for Reachy's USB
+        # microphone controller; the hardware is owned by the remote daemon.
+        AudioBase.__init__(self, log_level=log_level, initialize_doa=False)
 
         self._loop = GLib.MainLoop()
         self._thread_bus_calls = Thread(target=lambda: self._loop.run(), daemon=True)
@@ -706,11 +708,11 @@ class GstWebRTCClient(CameraBase, AudioBase):
             A tuple ``(angle_radians, speech_detected)`` or ``None``.
 
         """
-        return self._doa.get_DoA()
+        return super().get_DoA()
 
     def cleanup(self) -> None:
         """Release all resources."""
-        self._doa.close()
+        super().cleanup()
 
     def __del__(self) -> None:
         """Ensure GStreamer resources are released."""
