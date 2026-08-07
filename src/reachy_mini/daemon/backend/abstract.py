@@ -18,6 +18,7 @@ import time
 import typing
 from abc import abstractmethod
 from pathlib import Path
+from time import monotonic
 from typing import Annotated, Any, Callable, Dict, Optional
 
 import numpy as np
@@ -791,10 +792,10 @@ class Backend:
             elif move.sound_path is not None and audio_lead_s == 0:
                 self.play_sound(str(move.sound_path))
 
-            t0 = time.time()
+            started_at = monotonic()
             # Negative audio_lead_s: schedule sound to fire mid-loop,
-            # |audio_lead_s| seconds after t0. We hold a reference to
-            # the background task so the finally block can cancel it
+            # |audio_lead_s| seconds after motion playback starts. We hold a
+            # reference to the background task so the finally block can cancel it
             # if the motion loop exits before the sleep elapses (short
             # move + big negative lead would otherwise leak a task that
             # plays audio after the move has ended).
@@ -813,11 +814,12 @@ class Backend:
 
                 delayed_sound_task = asyncio.create_task(_delayed_sound())
             try:
-                while time.time() - t0 < move.duration:
+                while True:
                     if cancel_token is not None and cancel_token.cancelled:
                         self.logger.info("play_move cancelled, exiting playback loop")
                         break
-                    t = time.time() - t0
+                    iteration_started_at = monotonic()
+                    t = min(max(iteration_started_at - started_at, 0.0), move.duration)
 
                     head, antennas, body_yaw = move.evaluate(t)
                     if head is not None:
@@ -827,7 +829,10 @@ class Backend:
                     if antennas is not None:
                         self.set_target_antenna_joint_positions(antennas)
 
-                    elapsed = time.time() - t0 - t
+                    if t >= move.duration:
+                        break
+
+                    elapsed = monotonic() - iteration_started_at
                     if elapsed < sleep_period:
                         await asyncio.sleep(sleep_period - elapsed)
                     else:
