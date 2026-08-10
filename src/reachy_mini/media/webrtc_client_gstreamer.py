@@ -7,7 +7,7 @@ public methods as ``GStreamerCamera`` and ``GStreamerAudio`` so that
 
 Video pipeline (receive)::
 
-    webrtcsrc pad → queue → videoconvert → videoscale → videorate → appsink(BGR)
+    webrtcsrc pad → queue → videoconvert → videoscale → appsink(BGR)
 
 Audio pipeline (receive)::
 
@@ -177,6 +177,12 @@ class GstWebRTCClient(CameraBase, AudioBase):
         self._appsink_video.set_property(
             "caps", Gst.Caps.from_string("video/x-raw,format=BGR")
         )
+        # webrtcsrc can release several jitter-buffered frames together. A
+        # clock-synchronised appsink blocks the conversion branch until each
+        # frame's PTS, causing the one-frame queue above it to discard valid
+        # frames even when CPU is idle. The polling API only needs the newest
+        # decoded frame, so appsink must consume bursts immediately.
+        self._appsink_video.set_property("sync", False)
 
     def _configure_webrtcsrc(
         self, signaling_host: str, signaling_port: int, peer_id: str
@@ -303,23 +309,19 @@ class GstWebRTCClient(CameraBase, AudioBase):
             queue.set_property("flush-on-eos", True)
             videoconvert = Gst.ElementFactory.make("videoconvert")
             videoscale = Gst.ElementFactory.make("videoscale")
-            videorate = Gst.ElementFactory.make("videorate")
 
             self._pipeline_record.add(queue)
             self._pipeline_record.add(videoconvert)
             self._pipeline_record.add(videoscale)
-            self._pipeline_record.add(videorate)
             pad.link(queue.get_static_pad("sink"))
 
             queue.link(videoconvert)
             videoconvert.link(videoscale)
-            videoscale.link(videorate)
-            videorate.link(self._appsink_video)
+            videoscale.link(self._appsink_video)
 
             queue.sync_state_with_parent()
             videoconvert.sync_state_with_parent()
             videoscale.sync_state_with_parent()
-            videorate.sync_state_with_parent()
             self._appsink_video.sync_state_with_parent()
 
         elif pad.get_name().startswith("audio"):

@@ -139,6 +139,7 @@ def test_webrtc_client_does_not_upscale_to_camera_default() -> None:
 
     caps = client._appsink_video.get_property("caps").to_string()
     assert caps == "video/x-raw, format=(string)BGR"
+    assert client._appsink_video.get_property("sync") is False
 
 
 def test_webrtc_client_bounds_received_media_backlog() -> None:
@@ -169,6 +170,10 @@ def test_webrtc_client_bounds_received_media_backlog() -> None:
     assert queue.get_property("max-size-bytes") == 0
     assert queue.get_property("max-size-time") == 0
     assert queue.get_property("flush-on-eos") is True
+    assert all(
+        element.get_factory().get_name() != "videorate"
+        for element in client._iterate_gst(client._pipeline_record.iterate_elements())
+    )
 
 
 def test_webrtc_client_buffers_rtp_scheduler_jitter() -> None:
