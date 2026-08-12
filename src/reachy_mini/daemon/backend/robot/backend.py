@@ -18,15 +18,30 @@ import numpy.typing as npt
 from reachy_mini_motor_controller import ReachyMiniPyControlLoop
 
 from reachy_mini.io.protocol import (
+    AntennaMotionProfile,
+    AntennaMotorGains,
+    AntennaProfileType,
     HeadPoseMsg,
     ImuDataMsg,
     JointPositionsMsg,
     MotorControlMode,
     RobotBackendStatus,
 )
-from reachy_mini.utils.hardware_config.parser import parse_yaml_config
+from reachy_mini.utils.hardware_config.parser import (
+    ReachyMiniConfig,
+    parse_yaml_config,
+)
 
 from ..abstract import Backend
+
+_DRIVE_MODE_ADDRESS = 10
+_TORQUE_ENABLE_ADDRESS = 64
+_POSITION_D_GAIN_ADDRESS = 80
+_FEEDFORWARD_2_ADDRESS = 88
+_PROFILE_ACCELERATION_ADDRESS = 108
+_PROFILE_DURATION_ADDRESS = 112
+_GOAL_POSITION_ADDRESS = 116
+_TIME_BASED_PROFILE_BIT = 1 << 2
 
 
 class RobotBackend(Backend):
@@ -81,14 +96,7 @@ class RobotBackend(Backend):
         self.name2id = self.c.get_motor_name_id()
         if hardware_config_filepath is not None:
             config = parse_yaml_config(hardware_config_filepath)
-            for motor_name, motor_conf in config.motors.items():
-                if motor_conf.pid is not None:
-                    motor_id = self.name2id[motor_name]
-                    p, i, d = motor_conf.pid
-                    self.logger.info(
-                        f"Setting PID gains for motor '{motor_name}' (ID: {motor_id}): P={p}, I={i}, D={d}"
-                    )
-                    self.c.async_write_pid_gains(motor_id, p, i, d)
+            self._apply_configured_motor_gains(config)
 
         self.motor_control_mode = self._infer_control_mode()
         self._torque_enabled = self.motor_control_mode != MotorControlMode.Disabled
@@ -112,6 +120,15 @@ class RobotBackend(Backend):
         self._current_antennas_operation_mode = -1  # Default to torque control mode
         self.target_antenna_joint_current = None  # Placeholder for antenna joint torque
         self.target_head_joint_current = None  # Placeholder for head joint torque
+        self._applied_antenna_target_revision = -1
+        self._applied_antenna_profiles: (
+            tuple[
+                AntennaMotionProfile,
+                AntennaMotionProfile,
+            ]
+            | None
+        ) = None
+        self._configure_antenna_time_profiles()
 
         if hardware_error_check_frequency <= 0:
             raise ValueError(
@@ -206,10 +223,7 @@ class RobotBackend(Backend):
                     # self.c.set_body_rotation_goal_current(int(self.target_head_joint_current[0]))
 
             if self._current_antennas_operation_mode != 0:  # if position control mode
-                if self.target_antenna_joint_positions is not None:
-                    self.c.set_antennas_positions(
-                        self.target_antenna_joint_positions.tolist()
-                    )
+                self._write_pending_antenna_command()
             # Antenna torque control is not supported with feetech motors
             # else:
             #     if self.target_antenna_joint_current is not None:
@@ -319,6 +333,219 @@ class RobotBackend(Backend):
         self.c = None
         super().close()
 
+    def _antenna_motor_ids(self) -> tuple[int, int]:
+        """Return right and left antenna IDs without relying on fixed numbers."""
+        return self.name2id["right_antenna"], self.name2id["left_antenna"]
+
+    def _apply_configured_motor_gains(self, config: ReachyMiniConfig) -> None:
+        """Apply optional PID and feedforward gains from hardware YAML."""
+        assert self.c is not None, "Motor controller not initialized or already closed."
+
+        for motor_name, motor_conf in config.motors.items():
+            motor_id = self.name2id[motor_name]
+            if motor_conf.pid is not None:
+                p, i, d = motor_conf.pid
+                self.logger.info(
+                    f"Setting PID gains for motor '{motor_name}' (ID: {motor_id}): P={p}, I={i}, D={d}"
+                )
+                self.c.async_write_pid_gains(motor_id, p, i, d)
+
+            if motor_conf.ff1 is not None or motor_conf.ff2 is not None:
+                ff1 = 0 if motor_conf.ff1 is None else motor_conf.ff1
+                ff2 = 0 if motor_conf.ff2 is None else motor_conf.ff2
+                self.logger.info(
+                    f"Setting feedforward gains for motor '{motor_name}' (ID: {motor_id}): FF1={ff1}, FF2={ff2}"
+                )
+                # XL330 stores FF2 first at address 88, followed by FF1 at 90.
+                self.c.async_write_raw_bytes(
+                    motor_id,
+                    _FEEDFORWARD_2_ADDRESS,
+                    list(struct.pack("<HH", ff2, ff1)),
+                )
+
+    def set_antenna_motor_gains(
+        self,
+        right: AntennaMotorGains,
+        left: AntennaMotorGains,
+    ) -> None:
+        """Write and verify independent antenna PID/feedforward gains."""
+        assert self.c is not None, "Motor controller not initialized or already closed."
+
+        requested = (right, left)
+        for motor_id, gains in zip(self._antenna_motor_ids(), requested, strict=True):
+            self.c.async_write_pid_gains(motor_id, gains.p, gains.i, gains.d)
+            # XL330 stores FF2 first at address 88, followed by FF1 at 90.
+            self.c.async_write_raw_bytes(
+                motor_id,
+                _FEEDFORWARD_2_ADDRESS,
+                list(struct.pack("<HH", gains.ff2, gains.ff1)),
+            )
+
+        observed: list[AntennaMotorGains] = []
+        for motor_id in self._antenna_motor_ids():
+            # Reading through FF1 is also a queue barrier for the writes above.
+            data = bytes(
+                self.c.async_read_raw_bytes(
+                    motor_id,
+                    _POSITION_D_GAIN_ADDRESS,
+                    12,
+                )
+            )
+            observed.append(
+                AntennaMotorGains(
+                    d=struct.unpack_from("<H", data, 0)[0],
+                    i=struct.unpack_from("<H", data, 2)[0],
+                    p=struct.unpack_from("<H", data, 4)[0],
+                    ff2=struct.unpack_from("<H", data, 8)[0],
+                    ff1=struct.unpack_from("<H", data, 10)[0],
+                )
+            )
+
+        if tuple(observed) != requested:
+            raise RuntimeError(
+                "Antenna gain readback mismatch: "
+                f"requested={requested}, observed={tuple(observed)}"
+            )
+        self._antenna_motor_gains = requested
+        self.logger.info(
+            "Applied antenna motor gains: "
+            f"right={right.model_dump()}, left={left.model_dump()}"
+        )
+
+    def _configure_antenna_time_profiles(self) -> None:
+        """Enable XL330 time profiles and leave both antennas safely pinned."""
+        assert self.c is not None, "Motor controller not initialized or already closed."
+
+        ids = self._antenna_motor_ids()
+        present = list(self.c.get_last_position().antennas)
+        drive_modes = {
+            motor_id: self.c.async_read_raw_bytes(
+                motor_id,
+                _DRIVE_MODE_ADDRESS,
+                1,
+            )[0]
+            for motor_id in ids
+        }
+        changed_ids = [
+            motor_id
+            for motor_id in ids
+            if not drive_modes[motor_id] & _TIME_BASED_PROFILE_BIT
+        ]
+        torque_states = {
+            motor_id: self.c.async_read_raw_bytes(
+                motor_id,
+                _TORQUE_ENABLE_ADDRESS,
+                1,
+            )[0]
+            for motor_id in changed_ids
+        }
+        restore_torque_ids = [
+            motor_id for motor_id in changed_ids if torque_states[motor_id] != 0
+        ]
+
+        step = AntennaMotionProfile.step()
+        try:
+            if restore_torque_ids:
+                self.c.disable_torque_on_ids(restore_torque_ids)
+                for motor_id in changed_ids:
+                    torque = self.c.async_read_raw_bytes(
+                        motor_id,
+                        _TORQUE_ENABLE_ADDRESS,
+                        1,
+                    )
+                    if torque != [0]:
+                        raise RuntimeError(
+                            f"Could not disable antenna motor {motor_id} before changing Drive Mode"
+                        )
+
+            for motor_id in changed_ids:
+                updated = drive_modes[motor_id] | _TIME_BASED_PROFILE_BIT
+                self.c.async_write_raw_bytes(
+                    motor_id,
+                    _DRIVE_MODE_ADDRESS,
+                    [updated],
+                )
+                verified = self.c.async_read_raw_bytes(
+                    motor_id,
+                    _DRIVE_MODE_ADDRESS,
+                    1,
+                )
+                if verified != [updated]:
+                    raise RuntimeError(
+                        f"Could not enable time-based profiles for antenna motor {motor_id}"
+                    )
+
+            self._write_antenna_profiles((step, step), force=True)
+            self.c.set_antennas_positions(present)
+            # A blocking read is a queue barrier for the preceding raw writes
+            # and synchronized goal-position write.
+            self.c.async_read_raw_bytes(ids[0], _GOAL_POSITION_ADDRESS, 4)
+        finally:
+            if restore_torque_ids:
+                # Pin once more while torque is still off, even when Drive Mode
+                # verification failed, before returning ownership to the motors.
+                try:
+                    self._write_antenna_profiles((step, step), force=True)
+                    self.c.set_antennas_positions(present)
+                    self.c.async_read_raw_bytes(ids[0], _GOAL_POSITION_ADDRESS, 4)
+                finally:
+                    self.c.enable_torque_on_ids(restore_torque_ids)
+                    self.c.async_read_raw_bytes(
+                        restore_torque_ids[0],
+                        _TORQUE_ENABLE_ADDRESS,
+                        1,
+                    )
+
+    @staticmethod
+    def _profile_register_values(profile: AntennaMotionProfile) -> tuple[int, int]:
+        """Map a public profile to XL330 time-profile register values."""
+        if profile.profile_type is AntennaProfileType.STEP:
+            return 0, 0
+        if profile.profile_type is AntennaProfileType.RECTANGULAR:
+            return 0, profile.duration_ms
+        return profile.acceleration_duration_ms, profile.duration_ms
+
+    def _write_antenna_profiles(
+        self,
+        profiles: tuple[AntennaMotionProfile, AntennaMotionProfile],
+        *,
+        force: bool = False,
+    ) -> None:
+        """Write only the right/left profile registers that changed."""
+        assert self.c is not None, "Motor controller not initialized or already closed."
+        previous = getattr(self, "_applied_antenna_profiles", None)
+        for index, (motor_id, profile) in enumerate(
+            zip(self._antenna_motor_ids(), profiles, strict=True)
+        ):
+            if not force and previous is not None and previous[index] == profile:
+                continue
+            acceleration_ms, duration_ms = self._profile_register_values(profile)
+            self.c.async_write_raw_bytes(
+                motor_id,
+                _PROFILE_ACCELERATION_ADDRESS,
+                list(struct.pack("<I", acceleration_ms)),
+            )
+            self.c.async_write_raw_bytes(
+                motor_id,
+                _PROFILE_DURATION_ADDRESS,
+                list(struct.pack("<I", duration_ms)),
+            )
+        self._applied_antenna_profiles = profiles
+
+    def _write_pending_antenna_command(self) -> None:
+        """Consume a staged antenna command exactly once."""
+        assert self.c is not None, "Motor controller not initialized or already closed."
+        command = getattr(self, "_pending_antenna_command", None)
+        if command is None:
+            return
+        positions, profiles, revision = command
+        if revision == getattr(self, "_applied_antenna_target_revision", -1):
+            return
+        if hasattr(self, "name2id"):
+            self._write_antenna_profiles(profiles)
+        self.c.set_antennas_positions(positions.tolist())
+        self._applied_antenna_target_revision = revision
+
     def get_status(self) -> "RobotBackendStatus":
         """Get the current status of the robot backend."""
         self._status.error = self.error
@@ -346,7 +573,7 @@ class RobotBackend(Backend):
             self.c.set_stewart_platform_position(present_head_joints[1:].tolist())
             self.c.set_body_rotation(present_head_joints[0])
         if self._current_antennas_operation_mode != 0:
-            self.c.set_antennas_positions(present_antennas.tolist())
+            self._write_pending_antenna_command()
 
         self.c.enable_torque()
         self._torque_enabled = True
@@ -441,12 +668,10 @@ class RobotBackend(Backend):
             if mode != 0:
                 # if the mode is not torque control, we need to set the head joint positions
                 # to the current positions to avoid sudden movements
-                self.target_antenna_joint_positions = np.array(
-                    self.c.get_last_position().antennas
+                self.set_target_antenna_joint_positions(
+                    np.array(self.c.get_last_position().antennas)
                 )
-                self.c.set_antennas_positions(
-                    self.target_antenna_joint_positions.tolist()
-                )
+                self._write_pending_antenna_command()
                 self.c.enable_antennas(True)
             else:
                 self.c.enable_antennas(False)
@@ -694,5 +919,3 @@ class RobotBackend(Backend):
 
         result: bytes = bytes(self.c.write_raw_packet(packet))
         return result
-
-

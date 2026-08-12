@@ -26,6 +26,8 @@ from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
 
 from reachy_mini.io.protocol import (
+    AntennaMotionProfile,
+    AntennaMotorGains,
     AnyCommand,
     AppendRecordCmd,
     ApplyAudioConfigCmd,
@@ -63,6 +65,7 @@ from reachy_mini.io.protocol import (
     SetHeadTrackingCmd,
     SetMicrophoneVolumeCmd,
     SetMotorModeCmd,
+    SetProfiledAntennasCmd,
     SetSpeechOffsetsCmd,
     SetTargetCmd,
     SetTorqueCmd,
@@ -201,6 +204,15 @@ class Backend:
         self.target_antenna_joint_positions: (
             Annotated[NDArray[np.float64], (2,)] | None
         ) = None  # [0, 1]
+        self._antenna_target_revision = 0
+        self._pending_antenna_command: (
+            tuple[
+                Annotated[NDArray[np.float64], (2,)],
+                tuple[AntennaMotionProfile, AntennaMotionProfile],
+                int,
+            ]
+            | None
+        ) = None
         self.current_antenna_joint_positions: (
             Annotated[NDArray[np.float64], (2,)] | None
         ) = None  # [0, 1]
@@ -583,7 +595,33 @@ class Backend:
             positions (List[float]): A list of joint positions for the antenna.
 
         """
+        step = AntennaMotionProfile.step()
+        self.set_profiled_target_antenna_joint_positions(
+            positions,
+            (step, step),
+        )
+
+    def set_profiled_target_antenna_joint_positions(
+        self,
+        positions: Annotated[NDArray[np.float64], (2,)],
+        profiles: tuple[AntennaMotionProfile, AntennaMotionProfile],
+    ) -> None:
+        """Stage one synchronized antenna target with per-motor profiles."""
+        positions = np.asarray(positions, dtype=np.float64)
+        if positions.shape != (2,):
+            raise ValueError("Antenna positions must have shape (2,)")
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("Antenna positions must be finite")
+        if len(profiles) != 2:
+            raise ValueError("Exactly two antenna profiles are required")
+
+        positions = positions.copy()
+        revision = getattr(self, "_antenna_target_revision", 0) + 1
         self.target_antenna_joint_positions = positions
+        self._antenna_target_revision = revision
+        # This tuple is the control-loop handoff. Assign it last so the real
+        # backend never observes a new revision with stale target/profile data.
+        self._pending_antenna_command = (positions, profiles, revision)
 
     def set_speech_offsets(
         self,
@@ -1236,6 +1274,19 @@ class Backend:
         """Set the motor torque for specific motor names."""
         pass
 
+    def set_antenna_motor_gains(
+        self,
+        right: AntennaMotorGains,
+        left: AntennaMotorGains,
+    ) -> None:
+        """Configure independent antenna gains.
+
+        Simulation backends retain the requested values without touching
+        hardware. The real backend overrides this method with register writes
+        and readback verification.
+        """
+        self._antenna_motor_gains = (right, left)
+
     def write_raw_packet(self, packet: bytes) -> bytes:
         """Write a raw packet to the motor controller and return the response.
 
@@ -1336,6 +1387,14 @@ class Backend:
             if not _maybe_ignore("set_antennas"):
                 self.set_target_antenna_joint_positions(np.array(cmd.antennas))
             send_response({"status": "ok", "command": "set_antennas"})
+
+        elif isinstance(cmd, SetProfiledAntennasCmd):
+            if not _maybe_ignore("set_profiled_antennas"):
+                self.set_profiled_target_antenna_joint_positions(
+                    np.array(cmd.antennas),
+                    (cmd.profiles[0], cmd.profiles[1]),
+                )
+            send_response({"status": "ok", "command": "set_profiled_antennas"})
 
         elif isinstance(cmd, SetFullTargetCmd):
             if not _maybe_ignore("set_full_target"):

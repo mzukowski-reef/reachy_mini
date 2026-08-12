@@ -10,16 +10,21 @@ import asyncio
 import logging
 import time
 import warnings
+from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version
 from typing import Dict, List, Literal, Optional, Union, cast
 
 import numpy as np
 import numpy.typing as npt
+import requests
 from asgiref.sync import async_to_sync
 from scipy.spatial.transform import Rotation as R
 
 from reachy_mini.daemon.utils import daemon_check, is_local_camera_available
 from reachy_mini.io.protocol import (
+    AntennaMotionProfile,
+    AntennaMotorGains,
+    AntennaMotorGainsPair,
     AppendRecordCmd,
     DaemonStatus,
     FaceTarget,
@@ -31,6 +36,7 @@ from reachy_mini.io.protocol import (
     SetGravityCompensationCmd,
     SetHeadJointsCmd,
     SetHeadTrackingCmd,
+    SetProfiledAntennasCmd,
     SetSpeechOffsetsCmd,
     SetTargetCmd,
     SetTorqueCmd,
@@ -63,7 +69,10 @@ SLEEP_HEAD_JOINT_POSITIONS = [
 ]
 
 
-INIT_ANTENNAS_JOINT_POSITIONS = [-0.1745, 0.1745]  # ~10° offset to reduce shaking at vertical
+INIT_ANTENNAS_JOINT_POSITIONS = [
+    -0.1745,
+    0.1745,
+]  # ~10° offset to reduce shaking at vertical
 SLEEP_ANTENNAS_JOINT_POSITIONS = [-3.05, 3.05]
 SLEEP_HEAD_POSE = np.array(
     [
@@ -228,7 +237,9 @@ class ReachyMini:
             return
 
         self.media_manager.close()
-        self.media_manager = self._configure_mediamanager(self._media_backend, self._log_level)
+        self.media_manager = self._configure_mediamanager(
+            self._media_backend, self._log_level
+        )
         self._media_released = False
         self.logger.info("Media re-acquired by daemon.")
 
@@ -246,7 +257,10 @@ class ReachyMini:
         incoming WebRTC audio also produce head movement.
 
         """
-        def _send_offsets(offsets: tuple[float, float, float, float, float, float]) -> None:
+
+        def _send_offsets(
+            offsets: tuple[float, float, float, float, float, float],
+        ) -> None:
             try:
                 self.client.send_command(SetSpeechOffsetsCmd(offsets=list(offsets)))
             except ConnectionError:
@@ -638,7 +652,9 @@ class ReachyMini:
 
     def wake_up(self) -> None:
         """Wake up the robot - go to the initial head position and play the wake up emote and sound."""
-        self.goto_target(INIT_HEAD_POSE, antennas=INIT_ANTENNAS_JOINT_POSITIONS, duration=2)
+        self.goto_target(
+            INIT_HEAD_POSE, antennas=INIT_ANTENNAS_JOINT_POSITIONS, duration=2
+        )
         time.sleep(0.1)
 
         # Toudoum
@@ -670,7 +686,9 @@ class ReachyMini:
         ]
         dist = np.linalg.norm(np.array(current_positions) - np.array(init_positions))
         if dist > 0.2:
-            self.goto_target(INIT_HEAD_POSE, antennas=INIT_ANTENNAS_JOINT_POSITIONS, duration=1)
+            self.goto_target(
+                INIT_HEAD_POSE, antennas=INIT_ANTENNAS_JOINT_POSITIONS, duration=1
+            )
             time.sleep(0.2)
 
         # Pfiou
@@ -927,9 +945,89 @@ class ReachyMini:
         else:
             raise ValueError("Pose must be provided as a 4x4 matrix.")
 
-    def set_target_antenna_joint_positions(self, antennas: List[float]) -> None:
-        """Set the target joint positions of the antennas."""
-        self.client.send_command(SetAntennasCmd(antennas=antennas))
+    def set_target_antenna_joint_positions(
+        self,
+        antennas: List[float],
+        *,
+        profiles: AntennaMotionProfile | Mapping[str, object] | None = None,
+    ) -> None:
+        """Set antenna targets, optionally with independent motor profiles.
+
+        Args:
+            antennas: Right and left target positions in radians.
+            profiles: A single :class:`AntennaMotionProfile` (applied to both
+                antennas), a profile-shaped mapping applied to both, or a
+                ``{"right": ..., "left": ...}`` mapping for independent
+                profiles. Omitting this argument preserves the legacy step
+                behavior.
+
+        """
+        if len(antennas) != 2:
+            raise ValueError("Antennas must contain right and left positions")
+        if not all(np.isfinite(float(position)) for position in antennas):
+            raise ValueError("Antenna positions must be finite")
+
+        if profiles is None:
+            self.client.send_command(SetAntennasCmd(antennas=list(antennas)))
+            return
+
+        normalized: tuple[AntennaMotionProfile, AntennaMotionProfile]
+        if isinstance(profiles, AntennaMotionProfile):
+            normalized = profiles, profiles
+        elif isinstance(profiles, Mapping) and set(profiles) == {"right", "left"}:
+            normalized = (
+                AntennaMotionProfile.model_validate(profiles["right"]),
+                AntennaMotionProfile.model_validate(profiles["left"]),
+            )
+        else:
+            shared = AntennaMotionProfile.model_validate(profiles)
+            normalized = shared, shared
+
+        self.client.send_command(
+            SetProfiledAntennasCmd(
+                antennas=list(antennas),
+                profiles=list(normalized),
+            )
+        )
+
+    def set_antenna_motor_gains(
+        self,
+        *,
+        right: AntennaMotorGains | Mapping[str, object],
+        left: AntennaMotorGains | Mapping[str, object],
+        timeout: float = 5.0,
+    ) -> AntennaMotorGainsPair:
+        """Set and verify independent antenna PID/feedforward gains.
+
+        The gains are written to the antenna motors' volatile XL330 RAM
+        registers. They must therefore be reapplied after a motor power cycle
+        or any daemon startup that restores hardware configuration defaults.
+
+        Args:
+            right: Position P/I/D and FF1/FF2 gains for the right antenna.
+            left: Position P/I/D and FF1/FF2 gains for the left antenna.
+            timeout: HTTP request timeout in seconds.
+
+        Returns:
+            The gains read back and verified by the daemon.
+
+        """
+        requested = AntennaMotorGainsPair(
+            right=AntennaMotorGains.model_validate(right),
+            left=AntennaMotorGains.model_validate(left),
+        )
+        try:
+            response = requests.post(
+                f"{self._daemon_http_url}/api/motors/antenna-gains",
+                json=requested.model_dump(),
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise ConnectionError(
+                f"Could not configure antenna motor gains: {exc}"
+            ) from exc
+        return AntennaMotorGainsPair.model_validate(response.json())
 
     def set_target_body_yaw(self, body_yaw: float) -> None:
         """Set the target body yaw.

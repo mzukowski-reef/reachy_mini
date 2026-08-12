@@ -6,7 +6,7 @@ Provides endpoints to get and set the motor control mode.
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from reachy_mini.io.protocol import MotorControlMode
+from reachy_mini.io.protocol import AntennaMotorGainsPair, MotorControlMode
 
 from ....daemon.backend.abstract import Backend
 from ..dependencies import get_backend
@@ -41,3 +41,13 @@ async def set_motor_mode(
     backend.set_motor_control_mode(mode)
 
     return {"status": f"motors changed to {mode} mode"}
+
+
+@router.post("/antenna-gains")
+async def set_antenna_motor_gains(
+    gains: AntennaMotorGainsPair,
+    backend: Backend = Depends(get_backend),
+) -> AntennaMotorGainsPair:
+    """Set independent antenna PID/feedforward gains and verify readback."""
+    backend.set_antenna_motor_gains(gains.right, gains.left)
+    return gains

@@ -3,7 +3,8 @@
 All messages use a {"type": "...", ...payload} envelope.
 
 Client->Server command types:
-    set_target, set_head_joints, set_body_yaw, set_antennas, set_full_target,
+    set_target, set_head_joints, set_body_yaw, set_antennas,
+    set_profiled_antennas, set_full_target,
     goto_target, wake_up, goto_sleep, play_sound,
     set_motor_mode, set_torque, get_motor_mode,
     set_gravity_compensation, set_automatic_body_yaw,
@@ -24,10 +25,10 @@ Server->Client message types:
 
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, Self
 from uuid import UUID
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from reachy_mini.utils.interpolation import InterpolationTechnique
 
@@ -42,6 +43,123 @@ class MotorControlMode(str, Enum):
     Enabled = "enabled"
     Disabled = "disabled"
     GravityCompensation = "gravity_compensation"
+
+
+class AntennaProfileType(str, Enum):
+    """Selectable XL330 position-profile shapes for an antenna motor."""
+
+    STEP = "step"
+    RECTANGULAR = "rectangular"
+    TRAPEZOIDAL = "trapezoidal"
+
+
+ProfileSeconds = Annotated[
+    float,
+    Field(ge=0.001, le=32.737, allow_inf_nan=False),
+]
+
+MotorGainValue = Annotated[
+    int,
+    Field(ge=0, le=16_383, strict=True),
+]
+
+
+class AntennaMotorGains(BaseModel):
+    """XL330 position-controller gains for one antenna motor."""
+
+    model_config = ConfigDict(frozen=True)
+
+    p: MotorGainValue
+    i: MotorGainValue = 0
+    d: MotorGainValue = 0
+    ff1: MotorGainValue = 0
+    ff2: MotorGainValue = 0
+
+
+class AntennaMotorGainsPair(BaseModel):
+    """Independent right and left antenna motor gains."""
+
+    model_config = ConfigDict(frozen=True)
+
+    right: AntennaMotorGains
+    left: AntennaMotorGains
+
+
+class AntennaMotionProfile(BaseModel):
+    """Time-based position profile for one antenna motor.
+
+    ``duration`` and ``acceleration_duration`` are expressed in seconds and
+    quantized to the XL330's millisecond registers when sent to hardware.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    profile_type: AntennaProfileType
+    duration: ProfileSeconds | None = None
+    acceleration_duration: ProfileSeconds | None = None
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> Self:
+        """Reject timing combinations that the XL330 cannot represent."""
+        if self.profile_type is AntennaProfileType.STEP:
+            if self.duration is not None or self.acceleration_duration is not None:
+                raise ValueError("step profiles do not accept timing parameters")
+            return self
+
+        if self.duration is None:
+            raise ValueError(f"{self.profile_type.value} profiles require duration")
+
+        if self.profile_type is AntennaProfileType.RECTANGULAR:
+            if self.acceleration_duration is not None:
+                raise ValueError(
+                    "rectangular profiles do not accept acceleration_duration"
+                )
+            return self
+
+        if self.acceleration_duration is None:
+            raise ValueError("trapezoidal profiles require acceleration_duration")
+        if self.acceleration_duration_ms * 2 > self.duration_ms:
+            raise ValueError("acceleration_duration must not exceed half of duration")
+        return self
+
+    @property
+    def duration_ms(self) -> int:
+        """Return the profile duration quantized to milliseconds."""
+        return 0 if self.duration is None else round(self.duration * 1000.0)
+
+    @property
+    def acceleration_duration_ms(self) -> int:
+        """Return the acceleration duration quantized to milliseconds."""
+        if self.acceleration_duration is None:
+            return 0
+        return round(self.acceleration_duration * 1000.0)
+
+    @classmethod
+    def step(cls) -> Self:
+        """Create an unprofiled step command."""
+        return cls(profile_type=AntennaProfileType.STEP)
+
+    @classmethod
+    def rectangular(cls, *, duration: float) -> Self:
+        """Create a constant-velocity rectangular profile."""
+        return cls(
+            profile_type=AntennaProfileType.RECTANGULAR,
+            duration=duration,
+        )
+
+    @classmethod
+    def trapezoidal(
+        cls,
+        *,
+        duration: float,
+        acceleration_duration: float,
+    ) -> Self:
+        """Create a trapezoidal profile with symmetric acceleration ramps."""
+        return cls(
+            profile_type=AntennaProfileType.TRAPEZOIDAL,
+            duration=duration,
+            acceleration_duration=acceleration_duration,
+        )
 
 
 class DaemonState(str, Enum):
@@ -148,6 +266,17 @@ class SetAntennasCmd(BaseModel):
 
     type: Literal["set_antennas"] = "set_antennas"
     antennas: list[float]
+
+
+class SetProfiledAntennasCmd(BaseModel):
+    """Set antenna positions using independent right/left motor profiles."""
+
+    type: Literal["set_profiled_antennas"] = "set_profiled_antennas"
+    antennas: list[Annotated[float, Field(allow_inf_nan=False)]] = Field(
+        min_length=2,
+        max_length=2,
+    )
+    profiles: list[AntennaMotionProfile] = Field(min_length=2, max_length=2)
 
 
 class SetFullTargetCmd(BaseModel):
@@ -729,6 +858,7 @@ AnyCommand = Annotated[
     | SetHeadJointsCmd
     | SetBodyYawCmd
     | SetAntennasCmd
+    | SetProfiledAntennasCmd
     | SetFullTargetCmd
     | GotoTargetCmd
     | WakeUpCmd
