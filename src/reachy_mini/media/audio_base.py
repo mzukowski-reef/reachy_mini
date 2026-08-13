@@ -35,13 +35,6 @@ from reachy_mini.media.gstreamer_utils import get_sample, handle_default_bus_mes
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
-# Software AEC (webrtcdsp + webrtcechoprobe) constants shared by the audio
-# backends. The elements only accept S16LE at a fixed set of rates
-# (8000/16000/32000/48000) and must share a probe name to be paired.
-AEC_RATE = 48_000
-AEC_CHANNELS = 2
-AEC_PROBE_NAME = "reachymini_aec_probe"
-
 
 class AudioBase(ABC):
     """Abstract audio backend.

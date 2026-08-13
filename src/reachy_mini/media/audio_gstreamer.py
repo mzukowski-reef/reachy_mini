@@ -60,7 +60,7 @@ from typing import Optional
 
 import numpy as np
 
-from reachy_mini.media.audio_base import AEC_PROBE_NAME, AEC_RATE, AudioBase
+from reachy_mini.media.audio_base import AudioBase
 from reachy_mini.media.audio_utils import has_reachymini_asoundrc
 from reachy_mini.media.device_detection import get_audio_device
 from reachy_mini.motion.head_wobbler import HeadWobbler, SpeechOffsets
@@ -113,12 +113,6 @@ class GStreamerAudio(AudioBase):
         self._thread_bus_calls = Thread(target=lambda: self._loop.run(), daemon=True)
         self._thread_bus_calls.start()
 
-        self._webrtcechoprobe: Optional[Gst.Element] = None
-
-        # Single pipeline holds both record and playback chains so that
-        # webrtcdsp + webrtcechoprobe share a clock (required by the
-        # GStreamer webrtcdsp docs to align the far-end reference with
-        # the mic capture).
         self._pipeline = Gst.Pipeline.new("reachymini_audio")
         self._init_pipeline_record(self._pipeline)
         self._bus = self._pipeline.get_bus()
@@ -137,8 +131,6 @@ class GStreamerAudio(AudioBase):
         self._appsink_audio.set_property("max-buffers", 200)
 
         audiosrc: Optional[Gst.Element] = None
-        webrtcdsp: Optional[Gst.Element] = None
-
         if has_reachymini_asoundrc():
             # Wireless CM4: use the preconfigured .asoundrc ALSA devices
             # which route through the XMOS AEC loopback properly.
@@ -153,22 +145,6 @@ class GStreamerAudio(AudioBase):
                     "No specific audio card found, using default audio source."
                 )
                 audiosrc = Gst.ElementFactory.make("autoaudiosrc")  # use default mic
-                self._webrtcechoprobe = Gst.ElementFactory.make("webrtcechoprobe")
-                webrtcdsp = Gst.ElementFactory.make("webrtcdsp")
-                if self._webrtcechoprobe is None or webrtcdsp is None:
-                    self.logger.warning(
-                        "Cannot enable webrtcdsp. Check if gst-plugins-bad are available."
-                    )
-                    # Drop both so the playback chain doesn't wire a probe
-                    # without a matching DSP (or vice versa).
-                    self._webrtcechoprobe = None
-                    webrtcdsp = None
-                else:
-                    # Pair probe ↔ dsp so the playback signal is used as the
-                    # far-end reference for echo cancellation on the mic path.
-                    self._webrtcechoprobe.set_property("name", AEC_PROBE_NAME)
-                    webrtcdsp.set_property("probe", AEC_PROBE_NAME)
-                    self.logger.info("Enabling webRTC echo cancellation.")
             elif platform.system() == "Windows":
                 audiosrc = Gst.ElementFactory.make("wasapi2src")
                 audiosrc.set_property("device", id_audio_card)
@@ -192,28 +168,7 @@ class GStreamerAudio(AudioBase):
         pipeline.add(audioresample)
         pipeline.add(self._appsink_audio)
 
-        if webrtcdsp:
-            # webrtcdsp requires S16LE at 8/16/32/48 kHz — convert/resample
-            # in, then convert back to F32LE at SAMPLE_RATE for the appsink.
-            ac_in = Gst.ElementFactory.make("audioconvert")
-            ar_in = Gst.ElementFactory.make("audioresample")
-            cf_in = Gst.ElementFactory.make("capsfilter")
-            cf_in.set_property(
-                "caps",
-                Gst.Caps.from_string(
-                    f"audio/x-raw,format=S16LE,rate={AEC_RATE},"
-                    f"channels={self.CHANNELS},layout=interleaved"
-                ),
-            )
-            for el in (ac_in, ar_in, cf_in, webrtcdsp):
-                pipeline.add(el)
-            audiosrc.link(ac_in)
-            ac_in.link(ar_in)
-            ar_in.link(cf_in)
-            cf_in.link(webrtcdsp)
-            webrtcdsp.link(queue)
-        else:
-            audiosrc.link(queue)
+        audiosrc.link(queue)
 
         queue.link(audioconvert)
         audioconvert.link(audioresample)
@@ -416,27 +371,7 @@ class GStreamerAudio(AudioBase):
         silence_caps.link(silence_queue)
         silence_queue.link(mixer)
 
-        if self._webrtcechoprobe is not None:
-            # webrtcechoprobe requires S16LE at 8/16/32/48 kHz.
-            ac_probe = Gst.ElementFactory.make("audioconvert")
-            ar_probe = Gst.ElementFactory.make("audioresample")
-            cf_probe = Gst.ElementFactory.make("capsfilter")
-            cf_probe.set_property(
-                "caps",
-                Gst.Caps.from_string(
-                    f"audio/x-raw,format=S16LE,rate={AEC_RATE},"
-                    f"channels={self.CHANNELS},layout=interleaved"
-                ),
-            )
-            for el in (ac_probe, ar_probe, cf_probe, self._webrtcechoprobe):
-                pipeline.add(el)
-            mixer.link(ac_probe)
-            ac_probe.link(ar_probe)
-            ar_probe.link(cf_probe)
-            cf_probe.link(self._webrtcechoprobe)
-            self._webrtcechoprobe.link(tee)
-        else:
-            mixer.link(tee)
+        mixer.link(tee)
 
         tee.link(queue_speaker)
         queue_speaker.link(ac_speaker)
