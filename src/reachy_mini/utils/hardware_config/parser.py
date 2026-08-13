@@ -17,6 +17,8 @@ class MotorConfig:
     shutdown_error: int
     operating_mode: int
     pid: tuple[int, int, int] | None = None
+    ff1: int | None = None
+    ff2: int | None = None
 
 
 @dataclass
@@ -54,6 +56,8 @@ def parse_yaml_config(filename: str) -> ReachyMiniConfig:
                 shutdown_error=params["shutdown_error"],
                 operating_mode=params["operating_mode"],
                 pid=params.get("pid"),
+                ff1=params.get("ff1"),
+                ff2=params.get("ff2"),
             )
 
     serial = SerialConfig(baudrate=conf["serial"]["baudrate"])

@@ -28,6 +28,59 @@ with ReachyMini() as mini:
 ### Instant Control (`set_target`)
 Bypasses interpolation. Use this for high-frequency control (e.g., following a joystick or generated trajectory).
 
+### Hardware-profiled antenna movement
+
+On a real Reachy Mini, each antenna's XL330 can execute a time-based position
+profile internally. A single profile applies to both antennas, while a
+right/left mapping configures them independently:
+
+```python
+from reachy_mini import AntennaMotionProfile
+
+breathing = AntennaMotionProfile.trapezoidal(
+    duration=3.0,
+    acceleration_duration=1.09,
+)
+mini.set_target_antenna_joint_positions([-0.75, 0.75], profiles=breathing)
+
+mini.set_target_antenna_joint_positions(
+    [-0.25, 0.75],
+    profiles={
+        "right": AntennaMotionProfile.rectangular(duration=2.5),
+        "left": AntennaMotionProfile.trapezoidal(
+            duration=3.0,
+            acceleration_duration=1.0,
+        ),
+    },
+)
+```
+
+Available profiles are `step`, `rectangular`, and `trapezoidal`. The call is
+nonblocking: both goals are dispatched together and the motors execute their
+profiles independently. Omitting `profiles` keeps the legacy step behavior.
+
+### Antenna motor gains
+
+Applications that have hardware-specific calibration can set independent
+position PID and feedforward gains through the SDK:
+
+```python
+from reachy_mini import AntennaMotorGains
+
+applied = mini.set_antenna_motor_gains(
+    right=AntennaMotorGains(p=350, i=0, d=400, ff1=4, ff2=0),
+    left=AntennaMotorGains(p=250, i=0, d=400, ff1=8, ff2=0),
+)
+print(applied.right, applied.left)
+```
+
+The daemon writes both motors and verifies their register readback before the
+call returns. Values must be integers from 0 through 16383. These are volatile
+XL330 RAM settings: an application should reapply them after a motor power
+cycle or after daemon startup restores the hardware configuration defaults.
+Keep product-specific calibration in the application rather than changing the
+SDK's packaged hardware YAML.
+
 ## Sensors & Media
 
 The media architecture is described in detail in the [Media Architecture](media-architecture.md) section. Although accesssing audio and video from the SDK is similar across Reachy Mini versions, the underlying implementation differs.
