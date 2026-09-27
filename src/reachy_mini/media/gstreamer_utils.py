@@ -25,9 +25,8 @@ def handle_default_bus_message(
 ) -> bool:
     """Handle GStreamer bus messages with sensible defaults.
 
-    - ``EOS``: log a warning and return False (the bus watch is
-      removed).
-    - ``ERROR``: log the parsed error and return False.
+    - ``EOS``: log a warning and keep the watch alive.
+    - ``ERROR``: log the parsed error and keep the watch alive.
     - ``WARNING``: log the parsed warning and keep the watch alive.
     - ``LATENCY``: call ``pipeline.recalculate_latency()`` and return
       True.
@@ -35,15 +34,15 @@ def handle_default_bus_message(
 
     Callers can wrap this in their own handler to inject extra logic
     for a specific message type, then fall through to this helper for
-    the common cases.
+    the common cases. The pipeline owner must stop the pipeline and remove
+    its watch explicitly. Removing a watch on ERROR while other branches
+    are still running leaves an unbounded queue of unhandled messages.
     """
     if msg.type == Gst.MessageType.EOS:
         logger.warning("End-of-stream")
-        return False
     elif msg.type == Gst.MessageType.ERROR:
         err, debug = msg.parse_error()
         logger.error(f"Error: {err} {debug}")
-        return False
     elif msg.type == Gst.MessageType.WARNING:
         err, debug = msg.parse_warning()
         logger.warning(f"Warning: {err} {debug}")
