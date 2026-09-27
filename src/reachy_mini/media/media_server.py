@@ -28,7 +28,7 @@ import os
 import platform
 import time
 from dataclasses import dataclass, field
-from threading import Lock, Thread, get_native_id
+from threading import Lock, RLock, Thread, current_thread, get_native_id
 from typing import Any, Callable, Dict, Optional
 
 import gi
@@ -121,6 +121,7 @@ class _PeerWebRTCState:
     # Prevents double-notification when both `connection-state ==
     # failed` AND the deadline timer fire close together.
     failure_notified: bool = False
+    signal_handlers: list[tuple[Gst.Element, int]] = field(default_factory=list)
 
     def asdict(self) -> Dict[str, Any]:
         """Build a serialisable snapshot for diagnostics in failure notifications."""
@@ -209,11 +210,19 @@ class GstMediaServer:
         self._video_ipc_enabled = video_ipc_enabled
         self._log_level = log_level
         self._sim_mode = sim_mode
+        self._media_lock = RLock()
+        self._bus_lock = RLock()
+        self._bus_watches: dict[Gst.Pipeline, int] = {}
+        self._pending_pipeline_stops: dict[Gst.Pipeline, int] = {}
+        self._latency_source_id: Optional[int] = None
+        self._closed = True
+        self._error: Optional[str] = None
+        self._stopping = False
+        self._pipeline_sender: Optional[Gst.Pipeline] = None
 
         Gst.init([])
         self._loop = GLib.MainLoop()
         self._thread_bus_calls = Thread(target=lambda: self._loop.run(), daemon=True)
-        self._thread_bus_calls.start()
 
         match sim_mode:
             case SimulationMode.MUJOCO:
@@ -274,7 +283,15 @@ class GstMediaServer:
         self._playbin: Optional[Gst.Element] = None
         self._head_wobbler: Optional[HeadWobbler] = None
         self._pipeline_playback: Optional[Gst.Pipeline] = None
-        self._build_pipeline()
+        # Build lazily in start(). A constructor-only pipeline used to retain
+        # a bus watch when start() immediately replaced it.
+        self._closed = False
+        self._thread_bus_calls.start()
+
+    @property
+    def error(self) -> Optional[str]:
+        """Return the sender failure until media is explicitly started again."""
+        return self._error
 
     def _build_pipeline(self) -> None:
         """Build (or rebuild) the GStreamer pipeline from scratch."""
@@ -286,9 +303,7 @@ class GstMediaServer:
         self._video_idle_pad = None
         self._pipeline_sender = Gst.Pipeline.new("reachymini_webrtc_sender")
         self._bus_sender = self._pipeline_sender.get_bus()
-        self._bus_sender.add_watch(
-            GLib.PRIORITY_DEFAULT, self._on_bus_message, self._pipeline_sender
-        )
+        self._watch_pipeline(self._pipeline_sender)
 
         webrtcsink = self._configure_webrtc(self._pipeline_sender)
 
@@ -299,18 +314,85 @@ class GstMediaServer:
 
     def close(self) -> None:
         """Release GStreamer resources (MainLoop, bus watch)."""
-        self._logger.debug("Cleaning up GstMediaServer")
-        self._loop.quit()
-        self._bus_sender.remove_watch()
+        # Also safe after a constructor failure, before the loop was started.
+        if not hasattr(self, "_media_lock"):
+            return
+        with self._media_lock:
+            if self._closed:
+                return
+            self.stop()
+            self._closed = True
+            self._loop.quit()
+        thread = self._thread_bus_calls
+        if thread.is_alive() and thread is not current_thread():
+            thread.join(timeout=5)
 
     def __del__(self) -> None:
         """Destructor to ensure gstreamer resources are released."""
         self.close()
 
-    def _dump_latency(self) -> None:
+    def _dump_latency(self, pipeline: Gst.Pipeline) -> None:
+        if pipeline != self._pipeline_sender:
+            return
+        self._latency_source_id = None
         query = Gst.Query.new_latency()
-        self._pipeline_sender.query(query)
+        pipeline.query(query)
         self._logger.info(f"Pipeline latency {query.parse_latency()}")
+
+    def _schedule_latency_dump(self) -> None:
+        """Keep at most one pending latency diagnostic per sender."""
+        if self._stopping or self._pipeline_sender is None:
+            return
+        if self._latency_source_id is not None:
+            GLib.source_remove(self._latency_source_id)
+        self._latency_source_id = GLib.timeout_add_seconds(
+            5, self._dump_latency, self._pipeline_sender
+        )
+
+    def _watch_pipeline(self, pipeline: Gst.Pipeline) -> None:
+        """Track every bus source so stop/rebuild can release its references."""
+        with self._bus_lock:
+            if pipeline in self._bus_watches:
+                raise RuntimeError("Media pipeline already has a bus watch")
+            watch_id = pipeline.get_bus().add_watch(
+                GLib.PRIORITY_DEFAULT, self._on_bus_message, pipeline
+            )
+            if not watch_id:
+                raise RuntimeError("Could not watch media pipeline bus")
+            self._bus_watches[pipeline] = watch_id
+
+    def _dispose_pipeline(self, pipeline: Gst.Pipeline) -> None:
+        """Stop producers and flush their bus before removing its observer."""
+        if pipeline.set_state(Gst.State.NULL) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError(f"Could not stop media pipeline {pipeline.get_name()}")
+        with self._bus_lock:
+            pending = self._pending_pipeline_stops.pop(pipeline, None)
+            watch = self._bus_watches.pop(pipeline, None)
+        if pending is not None:
+            GLib.source_remove(pending)
+        if watch is not None:
+            GLib.source_remove(watch)
+
+    def _finish_pipeline(self, pipeline: Gst.Pipeline) -> bool:
+        """Handle terminal messages on the control loop, never a streaming task."""
+        with self._bus_lock:
+            self._pending_pipeline_stops.pop(pipeline, None)
+        with self._media_lock:
+            with self._bus_lock:
+                if pipeline not in self._bus_watches:
+                    return False  # A concurrent stop/restart already retired it.
+            if pipeline == self._pipeline_sender:
+                self.stop()
+            elif pipeline == self._playbin:
+                self.stop_sound()
+            else:
+                for peer_id, info in list(self._incoming_audio.items()):
+                    if info["playback_pipeline"] == pipeline:
+                        self._cleanup_incoming_audio(peer_id)
+                        break
+                else:
+                    self._dispose_pipeline(pipeline)
+        return False
 
     def _configure_webrtc(self, pipeline: Gst.Pipeline) -> Gst.Element:
         self._logger.debug("Configuring WebRTC")
@@ -466,6 +548,8 @@ class GstMediaServer:
         peer_id: str,
         webrtcbin: Gst.Element,
     ) -> None:
+        if self._stopping:
+            return
         self._logger.info(f"consumer added with peer id: {peer_id}")
         self._set_video_consumer_active(peer_id, active=True)
 
@@ -473,7 +557,7 @@ class GstMediaServer:
         #     self._pipeline_sender, Gst.DebugGraphDetails.ALL, "pipeline_full"
         # )
 
-        GLib.timeout_add_seconds(5, self._dump_latency)
+        self._schedule_latency_dump()
 
         self._setup_data_channel(peer_id, webrtcbin)
 
@@ -556,6 +640,8 @@ class GstMediaServer:
         Instead we use a pad probe to intercept RTP buffers and forward them
         to a completely separate playback pipeline via appsrc.
         """
+        if self._stopping or self._pipeline_sender is None:
+            return
         if pad.get_direction() != Gst.PadDirection.SRC:
             return
 
@@ -579,11 +665,13 @@ class GstMediaServer:
         self._logger.info(f"Setting up incoming audio playback for peer {peer_id}")
 
         # Build playback pipeline element-by-element
-        self._pipeline_playback = Gst.Pipeline.new(f"audio_playback_{peer_id}")
+        self._cleanup_incoming_audio(peer_id)
+        playback_pipeline = Gst.Pipeline.new(f"audio_playback_{peer_id}")
+        self._watch_pipeline(playback_pipeline)
 
         sender_clock = self._pipeline_sender.get_pipeline_clock()
-        self._pipeline_playback.use_clock(sender_clock)
-        self._pipeline_playback.set_start_time(Gst.CLOCK_TIME_NONE)
+        playback_pipeline.use_clock(sender_clock)
+        playback_pipeline.set_start_time(Gst.CLOCK_TIME_NONE)
 
         appsrc = Gst.ElementFactory.make("appsrc", self.INCOMING_AUDIO_SRC_NAME)
         appsrc.set_property("format", Gst.Format.TIME)
@@ -608,6 +696,7 @@ class GstMediaServer:
         audiosink = self._build_audiosink_element()
         if audiosink is None:
             self._logger.error("Failed to create audio sink element")
+            self._dispose_pipeline(playback_pipeline)
             return
         audiosink.set_property("sync", True)
         self._configure_incoming_audio_sink(audiosink)
@@ -642,7 +731,7 @@ class GstMediaServer:
             ar_wobbler,
             appsink_wobbler,
         ]:
-            self._pipeline_playback.add(elem)
+            playback_pipeline.add(elem)
         appsrc.link(rtpopusdepay)
         rtpopusdepay.link(opusdec)
         opusdec.link(tee)
@@ -655,14 +744,8 @@ class GstMediaServer:
         ac_wobbler.link(ar_wobbler)
         ar_wobbler.link(appsink_wobbler)
 
-        play_bus = self._pipeline_playback.get_bus()
-        play_bus.add_watch(
-            GLib.PRIORITY_DEFAULT, self._on_bus_message, self._pipeline_playback
-        )
-
-        self._pipeline_playback.set_state(Gst.State.PAUSED)
-        self._pipeline_playback.set_base_time(self._pipeline_sender.get_base_time())
-        self._pipeline_playback.set_state(Gst.State.PLAYING)
+        playback_pipeline.set_state(Gst.State.PAUSED)
+        playback_pipeline.set_base_time(self._pipeline_sender.get_base_time())
 
         # Pad probe: intercept every RTP buffer, forward to the separate
         # playback pipeline, then DROP so webrtcsink's pipeline is unaffected.
@@ -678,10 +761,12 @@ class GstMediaServer:
             self._head_wobbler.start()
 
         self._incoming_audio[peer_id] = {
-            "playback_pipeline": self._pipeline_playback,
+            "playback_pipeline": playback_pipeline,
             "probe_id": probe_id,
             "pad": pad,
         }
+        self._pipeline_playback = playback_pipeline
+        playback_pipeline.set_state(Gst.State.PLAYING)
         self._logger.info(f"Audio playback pipeline started for peer {peer_id}")
         self._notify_incoming_audio_ready(peer_id)
 
@@ -738,19 +823,6 @@ class GstMediaServer:
             return False
         return True
 
-    def _on_playback_bus_message(
-        self, bus: Gst.Bus, msg: Gst.Message, peer_id: str
-    ) -> bool:
-        """Handle messages from a per-peer audio playback pipeline."""
-        if msg.type == Gst.MessageType.ERROR:
-            err, debug = msg.parse_error()
-            self._logger.error(f"Audio playback error for {peer_id}: {err} {debug}")
-            return False
-        if msg.type == Gst.MessageType.EOS:
-            self._logger.info(f"Audio playback EOS for {peer_id}")
-            return False
-        return True
-
     def _cleanup_incoming_audio(self, peer_id: str) -> None:
         """Remove the incoming-audio pad probe and playback pipeline for a peer."""
         info = self._incoming_audio.pop(peer_id, None)
@@ -764,7 +836,9 @@ class GstMediaServer:
 
         playback_pipe = info.get("playback_pipeline")
         if playback_pipe is not None:
-            playback_pipe.set_state(Gst.State.NULL)
+            self._dispose_pipeline(playback_pipe)
+            if self._pipeline_playback == playback_pipe:
+                self._pipeline_playback = None
         self._logger.info(f"Cleaned up incoming audio for peer {peer_id}")
 
     def clear_incoming_audio(self) -> None:
@@ -1599,6 +1673,22 @@ class GstMediaServer:
     def _on_bus_message(
         self, bus: Gst.Bus, msg: Gst.Message, pipeline: Gst.Pipeline
     ) -> bool:
+        with self._bus_lock:
+            if pipeline not in self._bus_watches:
+                return True
+            if msg.type in (Gst.MessageType.ERROR, Gst.MessageType.EOS):
+                if pipeline not in self._pending_pipeline_stops:
+                    handle_default_bus_message(self._logger, msg, pipeline)
+                    if pipeline == self._pipeline_sender:
+                        self._error = (
+                            str(msg.parse_error()[0])
+                            if msg.type == Gst.MessageType.ERROR
+                            else "Media stream ended"
+                        )
+                    self._pending_pipeline_stops[pipeline] = GLib.idle_add(
+                        self._finish_pipeline, pipeline, priority=GLib.PRIORITY_DEFAULT
+                    )
+                return True
         return handle_default_bus_message(self._logger, msg, pipeline)
 
     def start(self) -> None:
@@ -1606,15 +1696,59 @@ class GstMediaServer:
 
         Rebuilding ensures a clean state after stop() released all hardware.
         """
-        self._logger.debug("Starting WebRTC (rebuilding pipeline)")
-        self._build_pipeline()
-        self._pipeline_sender.set_state(Gst.State.PLAYING)
-        GLib.timeout_add_seconds(5, self._dump_latency)
+        with self._media_lock:
+            if self._closed:
+                raise RuntimeError("Media server is closed")
+            self.stop()
+            self._stopping = False
+            self._error = None
+            try:
+                self._build_pipeline()
+                assert self._pipeline_sender is not None
+                result = self._pipeline_sender.set_state(Gst.State.PLAYING)
+                if result == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("Could not start media pipeline")
+                self._schedule_latency_dump()
+            except Exception:
+                self.stop()
+                raise
 
     def stop(self) -> None:
-        """Stop the pipeline and release all hardware (camera, audio)."""
-        self._logger.debug("Stopping WebRTC")
-        self._pipeline_sender.set_state(Gst.State.NULL)
+        """Release all media pipelines and GLib sources; safe to call repeatedly."""
+        with self._media_lock:
+            self._stopping = True
+            if self._latency_source_id is not None:
+                GLib.source_remove(self._latency_source_id)
+                self._latency_source_id = None
+            # Stop the sender first so pad-added cannot create another playback
+            # pipeline while we are tearing down the incoming-audio registry.
+            if self._pipeline_sender is not None:
+                self._dispose_pipeline(self._pipeline_sender)
+                self._pipeline_sender = None
+                self._bus_sender = None
+            for peer_id in list(self._incoming_audio):
+                self._cleanup_incoming_audio(peer_id)
+            self.stop_sound()
+            if self._head_wobbler is not None:
+                self._head_wobbler.stop()
+            with self._peer_states_lock:
+                peers = list(self._peer_states)
+            for peer_id in peers:
+                self._teardown_negotiation_watchdog(peer_id)
+            self._data_channels.clear()
+            with self._video_consumers_lock:
+                self._video_consumers.clear()
+            self._video_demand_gate = None
+            self._video_demand_selector = None
+            self._video_camera_pad = None
+            self._video_idle_pad = None
+            self._webrtcechoprobe = None
+            # Include partially constructed playback pipelines after a failed
+            # element creation, even if they never reached the peer registry.
+            with self._bus_lock:
+                remaining = list(self._bus_watches)
+            for pipeline in remaining:
+                self._dispose_pipeline(pipeline)
 
     def play_sound(self, sound_file: str) -> None:
         """Play a sound file on the robot's speaker.
@@ -1627,53 +1761,57 @@ class GstMediaServer:
                 found at the given path, it is looked up in the assets directory.
 
         """
-        if not os.path.exists(sound_file):
-            file_path = f"{ASSETS_ROOT_PATH}/{sound_file}"
-            if not os.path.exists(file_path):
-                self._logger.error(
-                    f"Sound file {sound_file} not found in assets directory "
-                    "or given path."
-                )
-                return
-        else:
-            file_path = sound_file
-
-        if self._playbin is not None:
-            self._playbin.set_state(Gst.State.NULL)
-
-        playbin = Gst.ElementFactory.make("playbin", "player")
-        if not playbin:
-            self._logger.error("Failed to create playbin element")
-            return
-
-        # Build file URI
-        if os.name == "nt":
-            uri_path = file_path.replace("\\", "/")
-            if not uri_path.startswith("/") and ":" in uri_path:
-                uri = f"file:///{uri_path}"
+        with self._media_lock:
+            if self._closed:
+                raise RuntimeError("Media server is closed")
+            if not os.path.exists(sound_file):
+                file_path = f"{ASSETS_ROOT_PATH}/{sound_file}"
+                if not os.path.exists(file_path):
+                    self._logger.error(
+                        f"Sound file {sound_file} not found in assets directory "
+                        "or given path."
+                    )
+                    return
             else:
-                uri = f"file://{uri_path}"
-        else:
-            uri = f"file://{file_path}"
+                file_path = sound_file
 
-        playbin.set_property("uri", uri)
-        playbin.set_property("audio-sink", self._build_audiosink_tee_bin())
+            self.stop_sound()
 
-        if self._head_wobbler is not None:
-            self._head_wobbler.reset()
-            self._head_wobbler.start()
+            playbin = Gst.ElementFactory.make("playbin", "player")
+            if not playbin:
+                self._logger.error("Failed to create playbin element")
+                return
 
-        self._playbin = playbin
-        playbin.set_state(Gst.State.PLAYING)
+            # Build file URI
+            if os.name == "nt":
+                uri_path = file_path.replace("\\", "/")
+                if not uri_path.startswith("/") and ":" in uri_path:
+                    uri = f"file:///{uri_path}"
+                else:
+                    uri = f"file://{uri_path}"
+            else:
+                uri = f"file://{file_path}"
+
+            playbin.set_property("uri", uri)
+            playbin.set_property("audio-sink", self._build_audiosink_tee_bin())
+
+            if self._head_wobbler is not None:
+                self._head_wobbler.reset()
+                self._head_wobbler.start()
+
+            self._playbin = playbin
+            self._watch_pipeline(playbin)
+            playbin.set_state(Gst.State.PLAYING)
 
     def stop_sound(self) -> None:
         """Stop the currently playing sound file.
 
         If no sound is currently playing this is a no-op.
         """
-        if self._playbin is not None:
-            self._playbin.set_state(Gst.State.NULL)
-            self._playbin = None
+        with self._media_lock:
+            if self._playbin is not None:
+                self._dispose_pipeline(self._playbin)
+                self._playbin = None
 
     def _build_audiosink_element(self) -> Optional[Gst.Element]:
         """Build a platform-aware audio sink GStreamer element.
@@ -1709,7 +1847,9 @@ class GstMediaServer:
                 if id_audio_card.startswith("hw:"):
                     audiosink = Gst.ElementFactory.make("alsasink")
                     audiosink.set_property("device", id_audio_card)
-                    self._logger.info(f"Using ALSA device {id_audio_card} for playback.")
+                    self._logger.info(
+                        f"Using ALSA device {id_audio_card} for playback."
+                    )
                 else:
                     audiosink = Gst.ElementFactory.make("pulsesink")
                     audiosink.set_property("device", f"{id_audio_card}")
@@ -1886,36 +2026,30 @@ class GstMediaServer:
 
         Runs on the GLib main thread (called from `_consumer_added`).
         """
+        self._teardown_negotiation_watchdog(peer_id)
         state = _PeerWebRTCState(peer_id=peer_id)
         with self._peer_states_lock:
             # In theory `consumer-added` fires once per peer_id, but
             # webrtcsink has been seen to re-add a peer after a brief
             # disconnect. Drop the previous watchdog if any to avoid
             # leaking timers.
-            existing = self._peer_states.pop(peer_id, None)
-            if existing is not None and existing.watchdog_source_id is not None:
-                GLib.source_remove(existing.watchdog_source_id)
             self._peer_states[peer_id] = state
 
         # `notify::*-state` fires every time the named property
         # changes, on whatever thread webrtcbin is using internally.
         # We pass `peer_id` as user data so the handlers don't need
         # to reverse-lookup the peer from the GObject.
-        webrtcbin.connect(
-            "notify::ice-connection-state",
-            self._on_ice_connection_state_change,
-            peer_id,
-        )
-        webrtcbin.connect(
-            "notify::connection-state",
-            self._on_connection_state_change,
-            peer_id,
-        )
-        webrtcbin.connect(
-            "notify::signaling-state",
-            self._on_signaling_state_change,
-            peer_id,
-        )
+        for signal, callback in (
+            ("notify::ice-connection-state", self._on_ice_connection_state_change),
+            ("notify::connection-state", self._on_connection_state_change),
+            ("notify::signaling-state", self._on_signaling_state_change),
+        ):
+            handler_id = webrtcbin.connect(signal, callback, peer_id)
+            with self._peer_states_lock:
+                if self._peer_states.get(peer_id) is state:
+                    state.signal_handlers.append((webrtcbin, handler_id))
+                else:
+                    webrtcbin.disconnect(handler_id)
 
         source_id = GLib.timeout_add_seconds(
             ICE_NEGOTIATION_DEADLINE_S,
@@ -1943,6 +2077,9 @@ class GstMediaServer:
             state = self._peer_states.pop(peer_id, None)
         if state is None:
             return
+        for element, handler_id in state.signal_handlers:
+            element.disconnect(handler_id)
+        state.signal_handlers.clear()
         if state.watchdog_source_id is not None:
             try:
                 GLib.source_remove(state.watchdog_source_id)
@@ -2150,7 +2287,7 @@ class GstMediaServer:
 
     def _on_data_channel_close(self, channel: Gst.Element, peer_id: str) -> None:
         self._logger.info(f"Data channel closed for peer {peer_id}")
-        if peer_id in self._data_channels:
+        if self._data_channels.get(peer_id) == channel:
             del self._data_channels[peer_id]
 
     def _on_data_channel_message(

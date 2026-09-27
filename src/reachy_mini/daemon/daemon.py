@@ -11,7 +11,7 @@ import logging
 import time
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from typing import Any, Optional
 
 from reachy_mini.daemon.robot_app_lock import RobotAppLock
@@ -100,6 +100,8 @@ class Daemon:
             None  # GstMediaServer when media is enabled
         )
         self._media_released = False
+        self._media_failed = False
+        self._media_lifecycle_lock = RLock()
         if not no_media:
             from reachy_mini.media.media_server import GstMediaServer
 
@@ -129,7 +131,42 @@ class Daemon:
     @property
     def media_released(self) -> bool:
         """Whether media hardware has been released for direct access."""
-        return self._media_released
+        return (
+            self._media_released
+            or self._media_failed
+            or (self._media_server is not None and self._media_server.error is not None)
+        )
+
+    async def _stop_media(self) -> None:
+        """Stop media and signalling even after the motor backend has vanished."""
+        with self._media_lifecycle_lock:
+            if self._media_server is not None:
+                self._media_server.stop()
+        await self._stop_central_signaling_relay()
+
+    async def _handle_backend_failure(
+        self,
+        backend: "RobotBackend | MujocoBackend | MockupSimBackend",
+        error: Exception,
+    ) -> None:
+        """Release media after a failed backend without issuing motor commands."""
+        with self._media_lifecycle_lock:
+            if self.backend is not backend:
+                return
+            self._status.state = DaemonState.ERROR
+            self._status.error = str(error)
+            self._media_failed = True
+            self._status.media_released = self.media_released
+            self._thread_event_publish_status.set()
+            ws_server = self.ws_server
+            try:
+                if self._media_server is not None:
+                    self._media_server.stop()
+            finally:
+                self.backend = None
+                if ws_server is not None:
+                    ws_server.stop()
+        await self._stop_central_signaling_relay()
 
     async def release_media(self) -> None:
         """Release camera and audio hardware so clients can access them directly.
@@ -141,8 +178,7 @@ class Daemon:
             return
 
         self.logger.info("Releasing media hardware for direct access...")
-        self._media_server.stop()
-        await self._stop_central_signaling_relay()
+        await self._stop_media()
         self._media_released = True
         self._status.media_released = True
         self.logger.info("Media hardware released.")
@@ -153,14 +189,16 @@ class Daemon:
         Restarts the GstMediaServer pipeline and central signalling relay.
         Idempotent: no-op if not currently released or no media server.
         """
-        if not self._media_released or self._media_server is None:
+        if not self.media_released or self._media_server is None:
             return
 
         self.logger.info("Re-acquiring media hardware...")
-        self._media_server.start()
+        with self._media_lifecycle_lock:
+            self._media_server.start()
+            self._media_released = False
+            self._media_failed = False
+            self._status.media_released = False
         await self._start_central_signaling_relay()
-        self._media_released = False
-        self._status.media_released = False
         self.logger.info("Media hardware re-acquired.")
 
     async def _start_central_signaling_relay(self) -> None:
@@ -312,73 +350,83 @@ class Daemon:
             )
             self._thread_publish_status.start()
 
-            def backend_wrapped_run() -> None:
-                assert self.backend is not None, (
-                    "Backend should be initialized before running."
-                )
+            backend = self.backend
 
+            def backend_wrapped_run() -> None:
                 try:
-                    self.backend.wrapped_run()
+                    backend.wrapped_run()
                 except Exception as e:
                     self.logger.error(f"Backend encountered an error: {e}")
-                    self._status.state = DaemonState.ERROR
-                    self._status.error = str(e)
-                    if self.ws_server is not None:
-                        self.ws_server.stop()
-                    self.backend = None
+                    # This runs on the backend thread, not a GStreamer streaming
+                    # task or the HTTP event loop. The relay owns its own loop.
+                    asyncio.run(self._handle_backend_failure(backend, e))
 
             self.backend_run_thread = Thread(target=backend_wrapped_run)
             self.backend_run_thread.start()
 
-            if not self.backend.ready.wait(timeout=2.0):
+            if not backend.ready.wait(timeout=2.0):
                 self.logger.error(
                     "Backend is not ready after 2 seconds. Some error occurred."
                 )
-                self._status.state = DaemonState.ERROR
-                self._status.error = self.backend.error
+                if self.backend is backend:
+                    self._status.state = DaemonState.ERROR
+                    self._status.error = backend.error
+                await self._stop_media()
                 return self._status.state
 
-            if self._media_server and not self._media_released:
-                if self.backend is not None:
-                    self.backend.setup_media_server(self._media_server)
-                    self.backend.set_restart_daemon_callback(self._spawn_webrtc_restart)
-                    self.backend.set_start_update_callback(self._spawn_webrtc_update)
-                self._media_server.start()
+            with self._media_lifecycle_lock:
+                if self.backend is not backend:
+                    return self._status.state
+                if self._media_server and not self._media_released:
+                    backend.setup_media_server(self._media_server)
+                    backend.set_restart_daemon_callback(self._spawn_webrtc_restart)
+                    backend.set_start_update_callback(self._spawn_webrtc_update)
+                    self._media_server.start()
+                    self._media_failed = False
+                    self._status.media_released = False
 
+            if self._media_server and not self.media_released:
                 # Start central signaling relay for remote WebRTC access
                 await self._start_central_signaling_relay()
+
+            if self.backend is not backend or self._status.state == DaemonState.ERROR:
+                await self._stop_media()
+                return self._status.state
 
             # Wire the wake-up hook before any wake can fire (on-start below, or
             # later via button/REST on the wireless unit, which boots asleep).
             if on_wake_up_callback is not None:
-                self.backend.set_on_wake_up_callback(on_wake_up_callback)
+                backend.set_on_wake_up_callback(on_wake_up_callback)
 
             if wake_up_on_start:
                 try:
                     self.logger.info("Waking up Reachy Mini...")
-                    self.backend.set_motor_control_mode(MotorControlMode.Enabled)
-                    await self.backend.wake_up()
+                    backend.set_motor_control_mode(MotorControlMode.Enabled)
+                    await backend.wake_up()
                 except Exception as e:
                     self.logger.error(f"Error while waking up Reachy Mini: {e}")
                     self._status.state = DaemonState.ERROR
                     self._status.error = str(e)
+                    await self._stop_media()
                     return self._status.state
                 except KeyboardInterrupt:
                     self.logger.warning("Wake up interrupted by user.")
                     self._status.state = DaemonState.STOPPING
+                    await self._stop_media()
                     return self._status.state
 
-            if self._status.state != DaemonState.ERROR:
-                self.logger.info("Daemon started successfully.")
-                self._status.state = DaemonState.RUNNING
-            else:
-                self.logger.error("Daemon started with errors.")
+            with self._media_lifecycle_lock:
+                if self.backend is backend:
+                    self.logger.info("Daemon started successfully.")
+                    self._status.state = DaemonState.RUNNING
+                else:
+                    self.logger.error("Daemon started with errors.")
 
         except Exception as e:
             self._status.state = DaemonState.ERROR
             self._status.error = str(e)
             self.logger.error(f"Failed to start daemon: {e}")
-
+            await self._stop_media()
         return self._status.state
 
     async def stop(self, goto_sleep_on_stop: bool = True) -> "DaemonState":
@@ -398,6 +446,9 @@ class Daemon:
             ``LOCAL_APP`` state here before restart.
 
         """
+        await self._stop_media()
+        self._thread_event_publish_status.set()
+
         if self._status.state == DaemonState.STOPPED:
             self.logger.warning("Daemon is already stopped.")
             return self._status.state
@@ -417,14 +468,6 @@ class Daemon:
             self._status.state = DaemonState.STOPPING
             self.backend.is_shutting_down = True
             self._thread_event_publish_status.set()
-
-            if self._media_server and not self._media_released:
-                # Stop pipeline (NULL) to release camera/audio hardware so
-                # external tools (rpicam-still, etc.) can access them.
-                # start() will rebuild the pipeline from scratch.
-                self._media_server.stop()
-                # Stop the central signaling relay
-                await self._stop_central_signaling_relay()
 
             if goto_sleep_on_stop:
                 try:
@@ -635,7 +678,9 @@ class Daemon:
 
         backend = self.backend
 
-        def _broadcast(status: str, *, line: str | None = None, error: str | None = None) -> None:
+        def _broadcast(
+            status: str, *, line: str | None = None, error: str | None = None
+        ) -> None:
             if backend is None:
                 return
             payload: dict[str, Any] = {"type": "update_progress", "status": status}
@@ -678,6 +723,7 @@ class Daemon:
 
     def status(self) -> "DaemonStatus":
         """Get the current status of the Reachy Mini daemon."""
+        self._status.media_released = self.media_released
         if self.backend is not None:
             self._status.backend_status = self.backend.get_status()
             self._status.face_target = self.backend.get_tracked_face()
