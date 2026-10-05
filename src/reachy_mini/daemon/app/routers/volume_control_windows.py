@@ -242,6 +242,32 @@ class VolumeControlWindows(VolumeControl):
             )
             return False
 
+    def _unmute_device(self, device: AudioDevice) -> bool:
+        """Clear the mute of an audio device and verify it.
+
+        Args:
+            device: The audio device.
+
+        Returns:
+            True if the device is unmuted afterwards, False otherwise.
+
+        """
+        try:
+            volume_interface = self._get_device_volume_interface(device.id)
+            if not volume_interface.GetMute():
+                return True
+            volume_interface.SetMute(0, None)
+            if volume_interface.GetMute():
+                logger.error(
+                    f"{device.device_type.value} device {device.name!r} stays muted"
+                )
+                return False
+            logger.info(f"Unmuted {device.device_type.value} device {device.name!r}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to unmute {device.device_type.value} device: {e}")
+            return False
+
     def get_output_volume(self) -> int:
         """Get the output volume.
 
@@ -252,16 +278,24 @@ class VolumeControlWindows(VolumeControl):
         return self._get_device_volume(self.output_device)
 
     def set_output_volume(self, volume: int) -> bool:
-        """Set the output volume.
+        """Set the output volume and unmute the output device.
+
+        Windows can mute the Reachy output again when the robot reconnects, and
+        a muted endpoint still reports its volume, so every write unmutes it,
+        including the startup check's write in prepare_output_device. The
+        Reachy output has a single hardware volume and mute stage on Windows;
+        there is no hidden stage to set to unity as on Linux.
 
         Args:
             volume: The volume to set between 0 (minimum volume) and 100 (maximum volume).
 
         Returns:
-            True if the volume was set successfully, False otherwise.
+            True if the volume was set and the device is unmuted, False otherwise.
 
         """
-        return self._set_device_volume(self.output_device, volume)
+        return self._set_device_volume(
+            self.output_device, volume
+        ) and self._unmute_device(self.output_device)
 
     def get_input_volume(self) -> int:
         """Get the input volume.
