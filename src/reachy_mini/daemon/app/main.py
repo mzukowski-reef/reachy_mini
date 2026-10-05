@@ -89,6 +89,7 @@ class Args:
     headless: bool = False
     no_media: bool = False
     video_ipc_enabled: bool = True
+    camera_auto_exposure_priority: bool = True
 
     kinematics_engine: str = "AnalyticalKinematics"
     check_collision: bool = False
@@ -309,6 +310,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
         no_media=args.no_media,
         video_ipc_enabled=args.video_ipc_enabled,
         sim_mode=sim_mode,
+        camera_auto_exposure_priority=args.camera_auto_exposure_priority,
     )
     app.state.app_manager = AppManager(
         wireless_version=args.wireless_version,
@@ -705,6 +707,14 @@ def main() -> None:
         dest="video_ipc_enabled",
         default=default_args.video_ipc_enabled,
         help="Disable the local raw-video IPC branch while keeping WebRTC media enabled.",
+    )
+    parser.add_argument(
+        "--no-camera-auto-exposure-priority",
+        action="store_false",
+        dest="camera_auto_exposure_priority",
+        default=default_args.camera_auto_exposure_priority,
+        help="On Windows, leave auto-exposure priority to Windows instead of "
+        "enabling it after every camera start.",
     )
     # Daemon options
     parser.add_argument(

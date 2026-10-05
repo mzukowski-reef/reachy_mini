@@ -47,6 +47,7 @@ class Daemon:
         no_media: bool = False,
         video_ipc_enabled: bool = True,
         sim_mode: SimulationMode = SimulationMode.NONE,
+        camera_auto_exposure_priority: bool = True,
     ) -> None:
         """Initialize the Reachy Mini daemon."""
         self.log_level = log_level
@@ -110,6 +111,7 @@ class Daemon:
                     log_level,
                     sim_mode=sim_mode,
                     video_ipc_enabled=video_ipc_enabled,
+                    camera_auto_exposure_priority=camera_auto_exposure_priority,
                 )
                 self._status.camera_specs_name = self._media_server.camera_specs.name
             except Exception as e:
