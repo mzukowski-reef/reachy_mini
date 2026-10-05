@@ -22,6 +22,7 @@ Example usage::
     >>> # The server is now streaming and ready to accept client connections
 """
 
+import importlib
 import json
 import logging
 import os
@@ -191,6 +192,7 @@ class GstMediaServer:
         log_level: str = "INFO",
         sim_mode: SimulationMode = SimulationMode.NONE,
         video_ipc_enabled: bool = True,
+        camera_auto_exposure_priority: bool = True,
     ) -> None:
         """Initialize the GStreamer WebRTC pipeline.
 
@@ -199,6 +201,9 @@ class GstMediaServer:
             sim_mode: Simulation mode. MUJOCO receives video via UDP,
                 MOCKUP uses autovideosrc, NONE detects a physical camera.
             video_ipc_enabled: Whether to expose raw local camera frames through IPC.
+            camera_auto_exposure_priority: On Windows, let automatic exposure
+                lower the frame rate in dim rooms after every camera start.
+                False leaves the control to Windows and other applications.
 
         Raises:
             RuntimeError: If no camera is detected (unless in simulation mode)
@@ -208,6 +213,7 @@ class GstMediaServer:
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(log_level)
         self._video_ipc_enabled = video_ipc_enabled
+        self._camera_auto_exposure_priority = camera_auto_exposure_priority
         self._log_level = log_level
         self._sim_mode = sim_mode
         self._media_lock = RLock()
@@ -1309,6 +1315,12 @@ class GstMediaServer:
         """
         camsrc = Gst.ElementFactory.make("mfvideosrc")
         camsrc.set_property("device-name", device_name)
+        if self._camera_auto_exposure_priority:
+            camsrc.get_static_pad("src").add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._on_first_windows_camera_buffer,
+                device_name,
+            )
 
         caps_mjpeg = Gst.Caps.from_string(
             f"image/jpeg,width={self.resolution[0]},"
@@ -1352,6 +1364,51 @@ class GstMediaServer:
         if not all(elements):
             raise RuntimeError("Failed to create Windows video source elements")
         return elements
+
+    def _on_first_windows_camera_buffer(
+        self,
+        pad: Gst.Pad,
+        info: Gst.PadProbeInfo,
+        device_name: str,
+    ) -> Gst.PadProbeReturn:
+        """Apply the camera profile once the camera streams, off the streaming thread."""
+        del pad, info
+        Thread(
+            target=self._apply_windows_camera_profile,
+            args=(device_name,),
+            name="camera-profile",
+            daemon=True,
+        ).start()
+        return Gst.PadProbeReturn.REMOVE
+
+    def _apply_windows_camera_profile(self, device_name: str) -> None:
+        """Enable auto-exposure priority after Windows applied its camera defaults.
+
+        Windows applies its stored per-user camera defaults whenever an
+        application starts the camera, so the first frame marks the earliest
+        point the setting sticks until the next camera start.
+        """
+        try:
+            # Windows-only module: type checkers on other platforms see no members.
+            controls = importlib.import_module(
+                "reachy_mini.media.camera_controls_windows"
+            )
+            reported = controls.set_auto_exposure_priority(device_name, True)
+        except Exception as exc:
+            self._logger.warning(
+                "Could not enable auto-exposure priority on camera %r: %s",
+                device_name,
+                exc,
+            )
+            return
+        if reported != 1:
+            self._logger.warning(
+                "Camera %r reports auto-exposure priority %d after enabling it",
+                device_name,
+                reported,
+            )
+            return
+        self._logger.info("Enabled auto-exposure priority on camera %r", device_name)
 
     def _build_macos_source(self, device_index: str) -> list[Gst.Element]:
         """Build source chain for macOS AVFoundation camera.
