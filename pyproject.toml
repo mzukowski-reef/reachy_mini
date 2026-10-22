@@ -107,6 +107,8 @@ exclude-newer = "7 days"
 
 [tool.uv.exclude-newer-package]
 "pollen_BMI088_imu_library"  = false
+# Security fix for the eMudhra CA compromise must not wait for the cooldown.
+"certifi" = false
 
 [tool.setuptools]
 package-dir = { "" = "src" }
