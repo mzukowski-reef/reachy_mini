@@ -1136,6 +1136,23 @@ class GstMediaServer:
             last_source.link(capsfilter_raw)
             last_source = capsfilter_raw
 
+            # On macOS the idle videotestsrc and avfvideosrc negotiate the same
+            # format with different optional fields (multiview-mode,
+            # pixel-aspect-ratio, interlace-mode). webrtcsink treats the
+            # demand selector's switch between them as a renegotiation, which
+            # it does not support, and the camera fails with not-negotiated.
+            # Rewrite the caps to one identical form after the capsfilter.
+            if platform.system() == "Darwin":
+                caps_setter = Gst.ElementFactory.make(
+                    "capssetter", "pre_tee_caps_setter"
+                )
+                caps_setter.set_property("caps", caps_raw)
+                caps_setter.set_property("replace", True)
+                caps_setter.set_property("join", False)
+                pipeline.add(caps_setter)
+                last_source.link(caps_setter)
+                last_source = caps_setter
+
         # --- Tee: split into IPC + WebRTC branches ---
         tee = Gst.ElementFactory.make("tee")
         pipeline.add(tee)
@@ -1420,6 +1437,19 @@ class GstMediaServer:
         mode (e.g. low-fps NV12 instead of the camera's preferred
         1920x1080@60).
         """
+        # Device detection can pick another camera (e.g. the built-in FaceTime
+        # camera), so allow pinning the avfvideosrc index explicitly.
+        override = os.environ.get("REACHY_MINI_CAMERA_INDEX", "").strip()
+        self._logger.info(
+            "macOS camera: detected device-index=%s, REACHY_MINI_CAMERA_INDEX=%r, caps=%sx%s@%s",
+            device_index,
+            override or None,
+            self.resolution[0],
+            self.resolution[1],
+            self.framerate,
+        )
+        if override:
+            device_index = override
         camsrc = Gst.ElementFactory.make("avfvideosrc")
         camsrc.set_property("device-index", int(device_index))
 
