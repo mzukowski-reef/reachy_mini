@@ -20,6 +20,7 @@ import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from uvicorn.main import STARTUP_FAILURE
 
 from reachy_mini.apps.manager import AppManager
 from reachy_mini.daemon import startup_app_config
@@ -544,7 +545,7 @@ def run_app(args: Args) -> None:
 
     sys.excepthook = exception_hook
 
-    async def run_server() -> None:
+    async def run_server() -> bool:
         # Set up asyncio exception handler to catch unhandled task exceptions
         loop = asyncio.get_running_loop()
 
@@ -612,15 +613,23 @@ def run_app(args: Args) -> None:
                     await health_check_task
                 except asyncio.CancelledError:
                     pass
+        return server.started
 
     try:
-        asyncio.run(run_server())
+        started = asyncio.run(run_server())
     except KeyboardInterrupt:
         logger.info("Shutdown complete.")
+        return
     except Exception as e:
         logger.exception(f"Error during shutdown: {e}")
         sys.stderr.flush()
         raise
+
+    if not started:
+        # serve() just returns when the app fails to start (uvicorn has logged
+        # why). Exit with uvicorn.run()'s status for that, not 0, so whoever
+        # started the daemon (systemd's Restart=on-failure, a launcher) sees it.
+        sys.exit(STARTUP_FAILURE)
 
 
 def main() -> None:
