@@ -92,6 +92,26 @@ DEFAULT_PROCESSING_FRAMERATE = 15
 VALVE_DROP_MODE_TRANSFORM_TO_GAP = 2
 VIDEO_TEST_PATTERN_BLACK = 2
 
+# The Raspberry Pi's hardware H264 encoder (v4l2h264enc, bcm2835-codec) was
+# tuned at 5 Mbit/s for the 1280x720 stream. Fed smaller frames at that rate it
+# rejects them ("Failed to process frame"): at 480x270 every run failed, even
+# from videotestsrc, while the rate scaled by the frame's area (0.7 Mbit/s)
+# never did, random noise included. The encoder's capture buffer stays 512 KB
+# at every size, so it is the bits per pixel the firmware refuses, not an
+# overflow. The rate therefore follows the processing stream's area.
+RPI_H264_BITRATE_AT_720P = 5_000_000
+RPI_H264_REFERENCE_PIXELS = 1280 * 720
+
+
+def rpi_h264_bitrate(width: int, height: int) -> int:
+    """Return the Pi H264 encoder's bitrate for a ``width`` x ``height`` stream.
+
+    The 720p rate scaled by the frame's area, never above the 720p rate.
+    """
+    scaled = RPI_H264_BITRATE_AT_720P * width * height // RPI_H264_REFERENCE_PIXELS
+    return min(RPI_H264_BITRATE_AT_720P, scaled)
+
+
 # Video is expendable under CPU pressure; audio playback and control are not.
 # Linux applies scheduling policy and nice values per thread, so demoting
 # GStreamer video tasks keeps their catch-up work from starving the speaker
@@ -1592,9 +1612,12 @@ class GstMediaServer:
         webrtcsink does not have v4l2h264enc, so we encode explicitly on RPi.
         """
         v4l2h264enc = Gst.ElementFactory.make("v4l2h264enc")
+        width, height = self.processing_resolution
+        bitrate = rpi_h264_bitrate(width, height)
+        self._logger.info(f"RPi H264 encoder: {width}x{height} at {bitrate} bit/s")
         extra_controls_structure = Gst.Structure.new_empty("extra-controls")
         extra_controls_structure.set_value("repeat_sequence_header", 1)
-        extra_controls_structure.set_value("video_bitrate", 5_000_000)
+        extra_controls_structure.set_value("video_bitrate", bitrate)
         extra_controls_structure.set_value("h264_i_frame_period", 60)
         extra_controls_structure.set_value("video_gop_size", 256)
         v4l2h264enc.set_property("extra-controls", extra_controls_structure)
