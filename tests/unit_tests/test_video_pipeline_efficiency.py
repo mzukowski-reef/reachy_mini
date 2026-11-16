@@ -127,6 +127,39 @@ def test_shared_raw_stream_uses_processing_geometry(monkeypatch) -> None:  # typ
     assert "framerate=(fraction)15/1" in caps
 
 
+def test_rpi_h264_bitrate_follows_the_processing_area() -> None:
+    """The Pi encoder rejects small frames at the 720p rate (5 Mbit/s)."""
+    assert media_server_module.rpi_h264_bitrate(1280, 720) == 5_000_000
+    assert media_server_module.rpi_h264_bitrate(480, 270) == 703_125
+    assert media_server_module.rpi_h264_bitrate(640, 360) == 1_250_000
+    assert media_server_module.rpi_h264_bitrate(1920, 1080) == 5_000_000
+
+
+def test_rpi_encoder_branch_uses_the_processing_bitrate(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The hardware encoder gets the bitrate of the processing stream's size."""
+    server = _make_server(monkeypatch)
+    made: dict[str, MagicMock] = {}
+
+    def make(factory: str, name: str | None = None) -> MagicMock:
+        element = MagicMock(name=factory)
+        made.setdefault(factory, element)
+        return element
+
+    monkeypatch.setattr(media_server_module.Gst.ElementFactory, "make", make)
+
+    server._build_rpi_encoder_branch(MagicMock(), MagicMock(), MagicMock())
+
+    controls = next(
+        call.args[1]
+        for call in made["v4l2h264enc"].set_property.call_args_list
+        if call.args[0] == "extra-controls"
+    )
+    assert server.processing_resolution == (960, 540)
+    assert controls.get_value("video_bitrate") == media_server_module.rpi_h264_bitrate(
+        960, 540
+    )
+
+
 def test_webrtc_client_does_not_upscale_to_camera_default() -> None:
     """Keep the daemon's negotiated geometry in the WebRTC client."""
     client = object.__new__(GstWebRTCClient)
